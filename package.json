@@ -1,0 +1,8 @@
+{
+  "name": "umwelt-monorepo",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "docs"
+  ]
+}
