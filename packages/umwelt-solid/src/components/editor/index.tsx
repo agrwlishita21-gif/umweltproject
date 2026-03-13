@@ -1,0 +1,61 @@
+import { createEffect } from 'solid-js';
+import { useUmweltSpec } from '../../contexts/UmweltSpecContext';
+import { Data } from './data';
+import { Fields } from './fields';
+import { Visual } from './visual';
+import { Audio } from './audio';
+import { ConversationAgent } from './ConversationAgent';
+import { SpeechEncoder } from './SpeechEncoder';
+import styles from '../../App.module.scss';
+import { Dynamic } from 'solid-js/web';
+import { createStoredSignal } from '../../util/solid';
+import { useUmweltDatastore } from '../../contexts/UmweltDatastoreContext';
+
+type EditorTab = 'data' | 'fields' | 'visual' | 'audio'| 'ConversationAgent';
+
+export function UmweltEditor() {
+  const [spec] = useUmweltSpec();
+  const [datastore] = useUmweltDatastore();
+  const data = () => datastore()[spec.data.name]?.data || [];
+  const [currentTab, setCurrentTab] = createStoredSignal<EditorTab>('umweltTab', data().length && spec.fields.length ? 'fields' : 'data');
+
+  createEffect(() => {
+    if (!(data().length && spec.fields.length)) {
+      setCurrentTab('data');
+    }
+  });
+
+  const tabs = {
+    data: Data,
+    fields: Fields,
+    visual: Visual,
+    audio: Audio,
+    ConversationAgent: ConversationAgent,
+  };
+
+  return (
+    <div class={styles.Editor}>
+      <div class="uw-editor" role="region" aria-label="Umwelt Editor">
+        <div role="tablist">
+          <button role="tab" id="tab-data" aria-controls="tabpanel-data" aria-selected={currentTab() === 'data'} onClick={() => setCurrentTab('data')}>
+            Data
+          </button>
+          <button role="tab" id="tab-fields" aria-controls="tabpanel-fields" aria-selected={currentTab() === 'fields'} onClick={() => setCurrentTab('fields')} disabled={!(data().length && spec.fields.length)}>
+            Fields
+          </button>
+          <button role="tab" id="tab-visual" aria-controls="tabpanel-visual" aria-selected={currentTab() === 'visual'} onClick={() => setCurrentTab('visual')} disabled={!(data().length && spec.fields.length)}>
+            Visual
+          </button>
+          <button role="tab" id="tab-audio" aria-controls="tabpanel-audio" aria-selected={currentTab() === 'audio'} onClick={() => setCurrentTab('audio')} disabled={!(data().length && spec.fields.length)}>
+            Audio
+          </button>
+          <button role="tab" id="tab-conversationAgent" aria-controls="tabpanel-conversationAgent" aria-selected={currentTab() === 'ConversationAgent'} onClick={() => setCurrentTab('ConversationAgent')} disabled={!(data().length && spec.fields.length)}>
+            Conversational Agent
+          </button>
+        </div>
+        <SpeechEncoder />
+        <Dynamic component={tabs[currentTab()]} />
+      </div>
+    </div>
+  );
+}
