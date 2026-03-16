@@ -1,4 +1,4 @@
-import { createSignal, For } from 'solid-js';
+import { createSignal, createEffect, For } from 'solid-js';
 import { styled } from 'solid-styled-components';
 import { useUmweltSpec } from '../../contexts/UmweltSpecContext';
 import { useUmweltDatastore } from '../../contexts/UmweltDatastoreContext';
@@ -38,6 +38,8 @@ type Step =
   | 'edit_type'
   | 'done';
 
+interface PendingEncoding { field: string; channel: EncodingPropName; }
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const VEGA_DATASETS = [
@@ -47,26 +49,28 @@ const VEGA_DATASETS = [
 
 const MEASURE_TYPES: MeasureType[] = ['quantitative', 'ordinal', 'nominal', 'temporal'];
 
+// ── Channel aliases ───────────────────────────────────────────────────────────
+
 const CHANNEL_ALIASES: Record<string, EncodingPropName> = {
-  x: 'x', 'x axis': 'x', 'x-axis': 'x', horizontal: 'x', 'h axis': 'x',
-  y: 'y', 'y axis': 'y', 'y-axis': 'y', vertical: 'y', 'v axis': 'y',
+  x: 'x', 'x axis': 'x', 'x-axis': 'x', horizontal: 'x',
+  y: 'y', 'y axis': 'y', 'y-axis': 'y', vertical: 'y',
   color: 'color', colour: 'color', hue: 'color',
-  shape: 'shape', mark: 'shape',
-  size: 'size', radius: 'size',
-  opacity: 'opacity', transparency: 'opacity', alpha: 'opacity',
-  pitch: 'pitch', frequency: 'pitch', freq: 'pitch', note: 'pitch',
-  volume: 'volume', loudness: 'volume', amplitude: 'volume',
+  shape: 'shape',
+  size: 'size',
+  opacity: 'opacity', transparency: 'opacity',
+  pitch: 'pitch', frequency: 'pitch', note: 'pitch',
+  volume: 'volume', loudness: 'volume',
   duration: 'duration', length: 'duration',
 };
 
 const TYPE_ALIASES: Record<string, MeasureType> = {
-  quantitative: 'quantitative', quant: 'quantitative', numeric: 'quantitative', number: 'quantitative', continuous: 'quantitative',
+  quantitative: 'quantitative', quant: 'quantitative', numeric: 'quantitative', number: 'quantitative',
   ordinal: 'ordinal', ordered: 'ordinal', ranked: 'ordinal',
   nominal: 'nominal', categorical: 'nominal', category: 'nominal', discrete: 'nominal',
-  temporal: 'temporal', time: 'temporal', date: 'temporal', datetime: 'temporal', dates: 'temporal',
+  temporal: 'temporal', time: 'temporal', date: 'temporal', datetime: 'temporal',
 };
 
-// ── Fuzzy field matching ──────────────────────────────────────────────────────
+// ── Fuzzy helpers ─────────────────────────────────────────────────────────────
 
 const norm = (s: string) => s.toLowerCase().replace(/[\s_\-()\/]+/g, '');
 
@@ -79,8 +83,7 @@ const fieldMatchScore = (spoken: string, fieldName: string): number => {
   const sToks = ns.match(/[a-z0-9]+/g) ?? [];
   const fToks = nf.match(/[a-z0-9]+/g) ?? [];
   const overlap = sToks.filter(t => fToks.some(ft => ft.includes(t) || t.includes(ft))).length;
-  if (overlap > 0) return 20 + overlap * 10;
-  return 0;
+  return overlap > 0 ? 20 + overlap * 10 : 0;
 };
 
 const bestFieldMatch = (spoken: string, pool: string[]): string | undefined => {
@@ -105,8 +108,47 @@ const resolveMeasureType = (spoken: string): MeasureType | undefined => {
   return Object.entries(TYPE_ALIASES).find(([k]) => lower.includes(k))?.[1];
 };
 
-// ── Typed encoding lookup helpers ─────────────────────────────────────────────
-// These replace `encoding[prop as any]` to satisfy TypeScript's index checks.
+const bestDatasetMatch = (text: string): string | undefined => {
+  const needle = norm(text);
+  let bestScore = 0, bestDataset: string | undefined;
+  for (const d of VEGA_DATASETS) {
+    const stem = norm(d.replace(/\.[^.]+$/, ''));
+    if (needle.includes(stem) || stem.includes(needle)) {
+      if (stem.length > bestScore) { bestScore = stem.length; bestDataset = d; }
+    }
+  }
+  return bestDataset;
+};
+
+const parseFieldList = (text: string, pool: string[]): string[] => {
+  const lower = text.toLowerCase().trim();
+  if (/^all$|^everything$|^all fields$/.test(lower)) return pool;
+  const exceptM = lower.match(/^(?:all|everything)(?:\s+(?:but|except|excluding|apart from|other than|minus))\s+(.+)$/);
+  if (exceptM) {
+    const parts = exceptM[1].split(/,\s*|\s+and\s+|\s*&\s*/).map(s => s.trim());
+    return pool.filter(f => !parts.some(p => bestFieldMatch(p, [f])));
+  }
+  const parts = lower.split(/,\s*|\s+and\s+|\s*&\s*/).map(s => s.trim()).filter(Boolean);
+  return pool.filter(f => parts.some(p => fieldMatchScore(p, f) > 0));
+};
+
+const parseEncodeCommand = (lower: string, activeFields: string[]): { field: string; channel: EncodingPropName } | null => {
+  const patterns = [
+    /(?:encode|map|set|assign|put|use|add)\s+(.+?)\s+(?:as|to|on|for|in|into)\s+(.+)/,
+    /(.+?)\s+(?:as|to|on|onto)\s+(?:the\s+)?(.+?)\s*(?:axis|channel|field)?$/,
+  ];
+  for (const pat of patterns) {
+    const m = lower.match(pat);
+    if (m) {
+      const field = bestFieldMatch(m[1].trim(), activeFields);
+      const channel = resolveChannel(m[2].trim());
+      if (field && channel) return { field, channel };
+    }
+  }
+  return null;
+};
+
+// ── Typed encoding helpers ─────────────────────────────────────────────────────
 
 const getVisualEncodingField = (
   units: ReturnType<ReturnType<typeof useUmweltSpec>[0]['visual']['units']['map']> extends (infer U)[] ? U[] : never,
@@ -152,7 +194,6 @@ const History = styled('ol')`
   scroll-behavior: smooth;
 `;
 
-// FIX: renamed prop from 'role' to 'msgrole' to avoid conflict with HTML role attribute (ts2322)
 const MessageItem = styled('li')<{ msgrole: Role }>`
   max-width: 84%;
   padding: 6px 10px;
@@ -221,32 +262,46 @@ const SendBtn = styled('button')`
   &:disabled { background: #aaa; cursor: default; }
 `;
 
+// ── Module-level persistent state ─────────────────────────────────────────────
+// Declared OUTSIDE the component so signals survive tab switches.
+// SolidJS recreates components on mount/unmount, so any signal inside the
+// component resets when the user switches tabs. Hoisting them here means
+// the conversation persists as long as the page is open.
+
+let _msgId = 0;
+const _mk = (role: Role, text: string): Message => ({ role, text, id: _msgId++ });
+
+const [messages, setMessages] = createSignal<Message[]>([
+  _mk('agent', 'Hi! What would you like to visualise?\n\nYou can describe the whole chart at once — e.g. "bar chart of weather data" — and I\'ll set it up for you automatically.'),
+]);
+const [step, setStep] = createSignal<Step>('data_source');
+const [inputVal, setInputVal] = createSignal('');
+const [listening, setListening] = createSignal(false);
+const [suggestions, setSuggestions] = createSignal<string[]>(['Example dataset', 'Load from URL']);
+const [liveMsg, setLiveMsg] = createSignal('');
+
+// Standard flow state
+const [reviewQueue, setReviewQueue] = createSignal<string[]>([]);
+const [reviewField, setReviewField] = createSignal<string | null>(null);
+const [pendingModality, setPendingModality] = createSignal<'visual' | 'audio' | 'both' | null>(null);
+const [pendingEncField, setPendingEncField] = createSignal<string | null>(null);
+const [pendingEncProp, setPendingEncProp] = createSignal<EncodingPropName | null>(null);
+const [stepBeforeEdit, setStepBeforeEdit] = createSignal<Step>('encoding');
+
+// Lookahead slots
+const [slotDataset, setSlotDataset] = createSignal<string | null>(null);
+const [slotMark, setSlotMark] = createSignal<string | null>(null);
+const [slotFields, setSlotFields] = createSignal<string[] | null>(null);
+const [slotModality, setSlotModality] = createSignal<'visual' | 'audio' | 'both' | null>(null);
+const [slotEncodings, setSlotEncodings] = createSignal<PendingEncoding[]>([]);
+
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export function ConversationAgent() {
   const [spec, specActions] = useUmweltSpec();
   const [, datastoreActions] = useUmweltDatastore();
 
-  let msgId = 0;
-  const mk = (role: Role, text: string): Message => ({ role, text, id: msgId++ });
-
-  const [messages, setMessages] = createSignal<Message[]>([
-    mk('agent', 'Hi! What data would you like to use?\n1. An example dataset\n2. Load from a URL'),
-  ]);
-  const [step, setStep] = createSignal<Step>('data_source');
-  const [input, setInput] = createSignal('');
-  const [listening, setListening] = createSignal(false);
-  const [suggestions, setSuggestions] = createSignal<string[]>(['1. Example dataset', '2. Load from URL']);
-  const [liveMsg, setLiveMsg] = createSignal('');
-
-  const [reviewQueue, setReviewQueue] = createSignal<string[]>([]);
-  const [reviewField, setReviewField] = createSignal<string | null>(null);
-
-  const [pendingModality, setPendingModality] = createSignal<'visual' | 'audio' | 'both' | null>(null);
-  const [pendingEncField, setPendingEncField] = createSignal<string | null>(null);
-  const [pendingEncProp, setPendingEncProp] = createSignal<EncodingPropName | null>(null);
-
-  const [stepBeforeEdit, setStepBeforeEdit] = createSignal<Step>('encoding');
+  const mk = _mk;
 
   const [vegaCache, setVegaCache] = createStoredSignal<Record<string, UmweltDataset>>('vegaDatasetsCache2', {});
 
@@ -267,7 +322,7 @@ export function ConversationAgent() {
     setMessages(m => [...m, mk(role, text)]);
     setSuggestions(chips);
     scrollDown();
-    if (role === 'agent') announce(text + (chips.length ? ` Suggested options: ${chips.join(', ')}.` : ''));
+    if (role === 'agent') announce(text + (chips.length ? ` Suggested: ${chips.join(', ')}.` : ''));
   };
 
   const activeFields = () => spec.fields.filter(f => f.active);
@@ -277,6 +332,95 @@ export function ConversationAgent() {
     ...spec.visual.units.map(u => ({ name: u.name, type: 'visual' as const })),
     ...spec.audio.units.map(u => ({ name: u.name, type: 'audio' as const })),
   ];
+
+  // ── Default to already-loaded dataset ────────────────────────────────────
+  // If the viewer already has a dataset (user loaded data on the Data tab
+  // before opening the agent), skip data_source and acknowledge it.
+  createEffect(() => {
+    if (step() === 'data_source' && spec.data.name && spec.fields.length) {
+      const defaults = inferDefaultFields();
+      const suggestion = defaults ? `${defaults.xField} and ${defaults.yField}` : null;
+      push('agent',
+        `I can see "${spec.data.name}" is already loaded with fields: ${spec.fields.map(f => f.name).join(', ')}.\n\n` +
+        `Which fields would you like to use? Say "all" or list them. Or describe a chart — e.g. "bar chart".` +
+        (suggestion ? `\n\nSuggested based on field types: ${suggestion}` : ''),
+        [
+          ...(suggestion ? [suggestion] : []),
+          'all',
+          ...spec.fields.map(f => f.name).slice(0, 3),
+        ]
+      );
+      setStep('fields');
+    }
+  });
+
+  // ── Vega-Lite style smart default field selection ─────────────────────────
+  // Replicates Vega-Lite's auto-encoding heuristic:
+  //   x axis: temporal > nominal > ordinal (categorical/time axis)
+  //   y axis: first quantitative field (measure axis)
+  // Falls back gracefully if some types are missing.
+
+  const inferDefaultFields = (): { xField: string; yField: string } | null => {
+    const fields = spec.fields;
+    if (!fields.length) return null;
+
+    // x axis priority: temporal first (best for time series), then nominal, then ordinal
+    const xField =
+      fields.find(f => f.type === 'temporal')?.name ??
+      fields.find(f => f.type === 'nominal')?.name ??
+      fields.find(f => f.type === 'ordinal')?.name;
+
+    // y axis: first quantitative field that isn't already chosen for x
+    const yField = fields.find(f => f.type === 'quantitative' && f.name !== xField)?.name;
+
+    // Need both to proceed
+    if (!xField || !yField) return null;
+    return { xField, yField };
+  };
+
+  // ── Slot extractor ────────────────────────────────────────────────────────
+  // Runs on EVERY user message. Scans for useful info and stores it for
+  // later auto-use, without interrupting the conversation flow.
+
+  const extractSlots = (text: string, allFieldNames: string[]) => {
+    const lower = text.toLowerCase();
+
+    if (!spec.data.name && !slotDataset()) {
+      const ds = bestDatasetMatch(lower);
+      if (ds) setSlotDataset(ds);
+    }
+
+    if (!slotMark()) {
+      const mark = (markTypes as string[]).find(m => new RegExp(`\\b${m}\\b`).test(lower));
+      if (mark) setSlotMark(mark);
+    }
+
+    if (!slotModality()) {
+      const hasV = /\bvisual\b/.test(lower);
+      const hasA = /\baudio\b/.test(lower);
+      const hasB = /\bboth\b/.test(lower);
+      if (hasB || (hasV && hasA)) setSlotModality('both');
+      else if (hasA) setSlotModality('audio');
+      else if (hasV) setSlotModality('visual');
+    }
+
+    if (allFieldNames.length && !slotFields()) {
+      const parsed = parseFieldList(text, allFieldNames);
+      if (parsed.length > 0 && parsed.length < allFieldNames.length) setSlotFields(parsed);
+      else if (/\ball\b/.test(lower)) setSlotFields(allFieldNames);
+    }
+
+    if (allFieldNames.length) {
+      const enc = parseEncodeCommand(lower, allFieldNames);
+      if (enc) {
+        setSlotEncodings(prev =>
+          prev.some(e => e.field === enc.field && e.channel === enc.channel)
+            ? prev
+            : [...prev, enc]
+        );
+      }
+    }
+  };
 
   // ── Summary builder ───────────────────────────────────────────────────────
 
@@ -293,9 +437,7 @@ export function ConversationAgent() {
           .join(', ');
         lines.push(`Visual unit "${unit.name}": mark = ${unit.mark}${encs ? `, encodings: ${encs}` : ', no encodings'}`);
       }
-    } else {
-      lines.push('Visual units: none');
-    }
+    } else { lines.push('Visual units: none'); }
     if (spec.audio.units.length) {
       for (const unit of spec.audio.units) {
         const encs = Object.entries(unit.encoding)
@@ -304,65 +446,9 @@ export function ConversationAgent() {
           .join(', ');
         lines.push(`Audio unit "${unit.name}":${encs ? ` encodings: ${encs}` : ' no encodings'}`);
       }
-    } else {
-      lines.push('Audio units: none');
-    }
+    } else { lines.push('Audio units: none'); }
     return lines.join('\n');
   };
-
-  // ── Parse field lists ─────────────────────────────────────────────────────
-
-  const parseFieldList = (text: string, pool: string[]): string[] => {
-    const lower = text.toLowerCase().trim();
-    if (/^all$|^everything$|^all fields$/.test(lower)) return pool;
-    const exceptM = lower.match(
-      /^(?:all|everything)(?:\s+(?:but|except|excluding|apart from|other than|minus))\s+(.+)$/
-    );
-    if (exceptM) {
-      const parts = exceptM[1].split(/,\s*|\s+and\s+|\s*&\s*/).map(s => s.trim());
-      return pool.filter(f => !parts.some(p => bestFieldMatch(p, [f])));
-    }
-    const parts = lower.split(/,\s*|\s+and\s+|\s*&\s*/).map(s => s.trim()).filter(Boolean);
-    return pool.filter(f => parts.some(p => (bestFieldMatch(p, [f]) ?? '') === f || fieldMatchScore(p, f) > 0));
-  };
-
-  // ── Dataset matching ──────────────────────────────────────────────────────
-
-  const bestDatasetMatch = (text: string): string | undefined => {
-    const needle = norm(text);
-    let bestScore = 0;
-    let bestDataset: string | undefined;
-    for (const d of VEGA_DATASETS) {
-      const stem = norm(d.replace(/\.[^.]+$/, ''));
-      if (needle.includes(stem) || stem.includes(needle)) {
-        if (stem.length > bestScore) { bestScore = stem.length; bestDataset = d; }
-      }
-    }
-    return bestDataset;
-  };
-
-  // ── Encode command parser ─────────────────────────────────────────────────
-
-  const parseEncodeCommand = (lower: string): { field: string; prop: EncodingPropName } | null => {
-    const patterns = [
-      /(?:encode|map|set|assign|put|use|add)\s+(.+?)\s+(?:as|to|on|for|in|into)\s+(.+)/,
-      /(.+?)\s+(?:as|to|on|onto)\s+(?:the\s+)?(.+?)\s*(?:axis|channel|field)?$/,
-    ];
-    for (const pat of patterns) {
-      const m = lower.match(pat);
-      if (m) {
-        const spokenField = m[1].trim();
-        const spokenChan = m[2].trim();
-        const field = bestFieldMatch(spokenField, activeFieldNames());
-        const prop = resolveChannel(spokenChan);
-        if (field && prop) return { field, prop };
-        if (field && !prop) return null;
-      }
-    }
-    return null;
-  };
-
-  // ── Encoding prompt ───────────────────────────────────────────────────────
 
   const encodingPrompt = () => {
     const mod = pendingModality();
@@ -377,15 +463,20 @@ export function ConversationAgent() {
   // ── Restart ───────────────────────────────────────────────────────────────
 
   const doRestart = () => {
-    setMessages([mk('agent', 'Restarting. What data would you like to use?\n1. An example dataset\n2. Load from a URL')]);
-    setSuggestions(['1. Example dataset', '2. Load from URL']);
+    setMessages([_mk('agent', 'Restarting. What would you like to visualise? You can describe the whole chart at once.')]);
+    setSuggestions(['Example dataset', 'Load from URL']);
     setStep('data_source');
     setReviewField(null);
     setReviewQueue([]);
     setPendingModality(null);
     setPendingEncField(null);
     setPendingEncProp(null);
-    announce('Restarted. What data would you like to use?');
+    setSlotDataset(null);
+    setSlotMark(null);
+    setSlotFields(null);
+    setSlotModality(null);
+    setSlotEncodings([]);
+    announce('Restarted.');
   };
 
   // ── Edit menu ─────────────────────────────────────────────────────────────
@@ -402,12 +493,14 @@ export function ConversationAgent() {
   };
 
   const handleEditMenu = (lower: string) => {
-    if (/cancel|never mind|back/.test(lower)) {
-      push('agent', 'Edit cancelled. Continuing where you left off.');
-      setStep(stepBeforeEdit()); return;
+    if (/cancel|never mind|back|no/.test(lower)) {
+      push('agent', 'No problem — chart is ready to use!',
+        ['Edit something', 'Add more encodings', 'Summary', 'Restart']
+      );
+      setStep('done'); return;
     }
     if (/dataset|data/.test(lower)) {
-      push('agent', `Available datasets: ${VEGA_DATASETS.join(', ')}.\nWhich dataset would you like?`, VEGA_DATASETS);
+      push('agent', `Available datasets: ${VEGA_DATASETS.join(', ')}.\nWhich one?`, VEGA_DATASETS);
       setStep('edit_dataset'); return;
     }
     if (/field/.test(lower) && !/type/.test(lower)) {
@@ -419,9 +512,9 @@ export function ConversationAgent() {
     }
     if (/mark/.test(lower)) {
       const units = spec.visual.units;
-      if (!units.length) { push('agent', 'No visual units to edit. Add one first.', EDIT_OPTIONS); return; }
+      if (!units.length) { push('agent', 'No visual units to edit.', EDIT_OPTIONS); return; }
       push('agent',
-        `Visual units: ${units.map(u => `"${u.name}" (${u.mark})`).join(', ')}.\nSay the unit name and mark type, e.g. "unit1 bar".`,
+        `Visual units: ${units.map(u => `"${u.name}" (${u.mark})`).join(', ')}.\nSay the unit name and new mark type.`,
         units.map(u => u.name)
       );
       setStep('edit_mark'); return;
@@ -460,9 +553,103 @@ export function ConversationAgent() {
   const onDataReady = () => {
     setTimeout(() => {
       const names = spec.fields.map(f => f.name);
+
+      // ── Fast path: user described a chart upfront ─────────────────────────
+      // If a mark type was mentioned, use Vega-Lite heuristics to auto-select
+      // fields and encodings, then ask the user if they want to change anything.
+      const mark = slotMark();
+      if (mark) {
+        // Activate slot fields if specified, otherwise all fields
+        const preFields = slotFields();
+        const fieldsToActivate = (preFields && preFields.filter(f => names.includes(f)).length)
+          ? preFields.filter(f => names.includes(f))
+          : names;
+        spec.fields.forEach(f => specActions.setFieldActive(f.name, fieldsToActivate.includes(f.name)));
+
+        // Run Vega-Lite heuristic to pick x and y
+        const defaults = inferDefaultFields();
+
+        if (defaults) {
+          const mod = slotModality() ?? 'visual';
+          setPendingModality(mod);
+          setSlotModality(null);
+
+          // Create visual unit and set mark
+          specActions.addVisualUnit();
+          const vUnit = spec.visual.units[spec.visual.units.length - 1]?.name;
+          if (vUnit) specActions.changeMark(vUnit, mark as any);
+          if (mod === 'both') specActions.addAudioUnit();
+          setSlotMark(null);
+          setSlotFields(null);
+
+          // Apply x and y encodings using inferred defaults
+          if (vUnit) {
+            specActions.addEncoding(defaults.xField, 'x', vUnit);
+            specActions.addEncoding(defaults.yField, 'y', vUnit);
+          }
+
+          // Apply any additional encodings user mentioned (e.g. color)
+          const extraEncs = slotEncodings().filter(
+            e => e.field !== defaults.xField && e.field !== defaults.yField
+          );
+          for (const enc of extraEncs) {
+            const candidates = allUnits().filter(u =>
+              (isVisualProp(enc.channel) && u.type === 'visual') ||
+              (isAudioProp(enc.channel) && u.type === 'audio')
+            );
+            if (candidates.length) specActions.addEncoding(enc.field, enc.channel, candidates[0].name);
+          }
+          setSlotEncodings([]);
+
+          // Get field types for the confirmation message
+          const xType = spec.fields.find(f => f.name === defaults.xField)?.type ?? '';
+          const yType = spec.fields.find(f => f.name === defaults.yField)?.type ?? '';
+
+          // Tell the user what was created and ask if they want to change anything
+          push('agent',
+            `Done! I've created a "${mark}" chart using:\n` +
+            `  • x = ${defaults.xField} (${xType})\n` +
+            `  • y = ${defaults.yField} (${yType})\n\n` +
+            `Would you like to change anything?`,
+            ['Looks good, done!', 'Change mark type', 'Change x field', 'Change y field', 'Add another encoding', 'Change dataset']
+          );
+          setStep('edit_menu');
+          return;
+        }
+      }
+
+      // ── Standard path: user gave us pre-specified fields ──────────────────
+      const preFields = slotFields();
+      if (preFields && preFields.length) {
+        const validFields = preFields.filter(f => names.includes(f));
+        if (validFields.length) {
+          spec.fields.forEach(f => specActions.setFieldActive(f.name, validFields.includes(f.name)));
+          push('agent',
+            `Data loaded! Auto-selected fields you mentioned: ${validFields.join(', ')}.\nWould you like visual, audio, or both?`,
+            ['Visual', 'Audio', 'Both']
+          );
+          setSlotFields(null);
+          setStep('modality');
+          return;
+        }
+      }
+
+      // ── Slow path: ask the user ───────────────────────────────────────────
+      // Still show a type-based suggestion as a chip so users can pick quickly
+      const defaults = inferDefaultFields();
+      const suggestionChip = defaults
+        ? `${defaults.xField} and ${defaults.yField}`
+        : null;
+
       push('agent',
-        `Data loaded! Fields: ${names.join(', ')}.\n\nWhich fields would you like to use? Say "all", "all but X", "everything except X and Y", or list them.`,
-        ['all', ...names.slice(0, 4)]
+        `Data loaded! Fields: ${names.join(', ')}.\n\n` +
+        `Which fields would you like to use? Say "all", "all but X", or list them.` +
+        (suggestionChip ? `\n\nSuggested based on field types: ${suggestionChip}` : ''),
+        [
+          ...(suggestionChip ? [suggestionChip] : []),
+          'all',
+          ...names.slice(0, 3),
+        ]
       );
       setStep('fields');
     }, 300);
@@ -485,8 +672,13 @@ export function ConversationAgent() {
   const loadUrl = (url: string) => {
     const filename = url.split('/').pop() || url;
     getData(url).then(data => {
-      if (data?.length) { datastoreActions.setDataset(filename, data, url); specActions.initializeData(filename); onDataReady(); }
-      else push('agent', "Couldn't fetch data from that URL. Please check it and try again.");
+      if (data?.length) {
+        datastoreActions.setDataset(filename, data, url);
+        specActions.initializeData(filename);
+        onDataReady();
+      } else {
+        push('agent', "Couldn't fetch data from that URL. Please check it and try again.");
+      }
     });
   };
 
@@ -506,7 +698,10 @@ export function ConversationAgent() {
 
   const nextFieldReview = () => {
     const queue = reviewQueue();
-    if (!queue.length) { push('agent', encodingPrompt(), activeFieldNames().slice(0, 3).map(f => `encode ${f} as x`)); setStep('encoding'); return; }
+    if (!queue.length) {
+      push('agent', encodingPrompt(), activeFieldNames().slice(0, 3).map(f => `encode ${f} as x`));
+      setStep('encoding'); return;
+    }
     const next = queue[0];
     setReviewQueue(queue.slice(1));
     setReviewField(next);
@@ -517,19 +712,176 @@ export function ConversationAgent() {
     );
   };
 
+  const applySlotEncodings = (): boolean => {
+    const encs = slotEncodings();
+    if (!encs.length) return false;
+    const applied: string[] = [];
+    for (const enc of encs) {
+      const candidates = allUnits().filter(u =>
+        (isVisualProp(enc.channel) && u.type === 'visual') ||
+        (isAudioProp(enc.channel) && u.type === 'audio')
+      );
+      if (candidates.length) {
+        specActions.addEncoding(enc.field, enc.channel, candidates[0].name);
+        applied.push(`"${enc.field}" → ${enc.channel}`);
+      }
+    }
+    setSlotEncodings([]);
+    if (applied.length) {
+      push('agent',
+        `Auto-applied encodings you mentioned: ${applied.join(', ')}.\n\n` + encodingPrompt(),
+        activeFieldNames().slice(0, 3).map(f => `encode ${f} as y`)
+      );
+      return true;
+    }
+    return false;
+  };
+
+  // ── Global auto-chart command ─────────────────────────────────────────────
+  // Runs the full Vega-Lite heuristic from anywhere mid-conversation.
+  // Called when user says "make a bar chart", "create a line chart", etc.
+  // Requires data to already be loaded.
+
+  const doAutoChart = (mark: string): boolean => {
+    if (!spec.data.name || !spec.fields.length) {
+      push('agent', 'Please load a dataset first, then I can create the chart.', ['Example dataset', 'Load from URL']);
+      return true;
+    }
+
+    // Activate all fields so inferDefaultFields has the full set to work with
+    spec.fields.forEach(f => specActions.setFieldActive(f.name, true));
+
+    const defaults = inferDefaultFields();
+    if (!defaults) {
+      push('agent',
+        `I couldn't infer sensible default fields for a "${mark}" chart — the dataset may not have a mix of quantitative and categorical/temporal fields.\n\nPlease encode fields manually:`,
+        activeFieldNames().slice(0, 3).map(f => `encode ${f} as x`)
+      );
+      setStep('encoding');
+      return true;
+    }
+
+    // Clear any existing visual units and re-create cleanly
+    for (const unit of [...spec.visual.units]) specActions.removeVisualUnit(unit.name);
+    specActions.addVisualUnit();
+    const vUnit = spec.visual.units[spec.visual.units.length - 1]?.name;
+    if (vUnit) {
+      specActions.changeMark(vUnit, mark as any);
+      specActions.addEncoding(defaults.xField, 'x', vUnit);
+      specActions.addEncoding(defaults.yField, 'y', vUnit);
+    }
+
+    setPendingModality('visual');
+    setSlotMark(null);
+    setSlotEncodings([]);
+
+    const xType = spec.fields.find(f => f.name === defaults.xField)?.type ?? '';
+    const yType = spec.fields.find(f => f.name === defaults.yField)?.type ?? '';
+
+    push('agent',
+      `Done! Created a "${mark}" chart using:\n` +
+      `  • x = ${defaults.xField} (${xType})\n` +
+      `  • y = ${defaults.yField} (${yType})\n\n` +
+      `Would you like to change anything?`,
+      ['Looks good, done!', 'Change mark type', 'Change x field', 'Change y field', 'Add another encoding']
+    );
+    setStep('edit_menu');
+    return true;
+  };
+
+  // ── Global channel reassignment ───────────────────────────────────────────
+  // Catches "change x to price", "set y to temperature", "make color symbol"
+  // at any step when there is at least one visual unit.
+
+  const handleChannelReassignment = (lower: string): boolean => {
+    if (!spec.visual.units.length && !spec.audio.units.length) return false;
+
+    // Patterns: "change x to price", "set y to horsepower", "make color symbol",
+    //           "use date for x", "x should be date", "x = date"
+    const patterns = [
+      /(?:change|set|make|update|switch)\s+(.+?)\s+(?:to|as|=)\s+(.+)/,
+      /(?:use|put)\s+(.+?)\s+(?:for|on|as)\s+(.+)/,
+      /(.+?)\s+(?:should be|=)\s+(.+)/,
+    ];
+
+    for (const pat of patterns) {
+      const m = lower.match(pat);
+      if (!m) continue;
+
+      // Try both orderings: "change x to price" and "change price to x"
+      const a = m[1].trim(), b = m[2].trim();
+
+      // Order 1: a is channel, b is field
+      const chanFromA = resolveChannel(a);
+      const fieldFromB = bestFieldMatch(b, spec.fields.map(f => f.name));
+      if (chanFromA && fieldFromB) {
+        return applyChannelReassignment(chanFromA, fieldFromB);
+      }
+
+      // Order 2: a is field, b is channel
+      const fieldFromA = bestFieldMatch(a, spec.fields.map(f => f.name));
+      const chanFromB = resolveChannel(b);
+      if (fieldFromA && chanFromB) {
+        return applyChannelReassignment(chanFromB, fieldFromA);
+      }
+    }
+
+    return false;
+  };
+
+  const applyChannelReassignment = (channel: EncodingPropName, fieldName: string): boolean => {
+    // Find the first unit that supports this channel type
+    const unit = allUnits().find(u =>
+      (isVisualProp(channel) && u.type === 'visual') ||
+      (isAudioProp(channel) && u.type === 'audio')
+    );
+    if (!unit) {
+      const needed = isVisualProp(channel) ? 'visual' : 'audio';
+      push('agent', `No ${needed} unit found. Say "add ${needed} unit" first.`);
+      return true;
+    }
+
+    // Activate the field if it isn't already
+    specActions.setFieldActive(fieldName, true);
+
+    // addEncoding replaces any existing encoding on that channel
+    specActions.addEncoding(fieldName, channel, unit.name);
+
+    push('agent',
+      `Updated: ${channel} = ${fieldName}.\n\n${buildSummary()}`,
+      ['Looks good, done!', 'Change another channel', 'Add encoding', 'Edit something']
+    );
+    // Stay on current step so user can keep making changes
+    return true;
+  };
+
   // ── Global intent detection ───────────────────────────────────────────────
 
   const handleGlobal = (lower: string): boolean => {
     if (/\brestart\b|start over|start again|reset|begin again/.test(lower)) {
       doRestart(); return true;
     }
-    if (/\bsummary\b|what have i|what did i|where am i|show state|current state|what's set/.test(lower)) {
+    if (/\bsummary\b|what have i|what did i|where am i|show state|current state|what'?s set/.test(lower)) {
       push('agent', buildSummary(), ['Edit something', 'Continue', 'Restart']);
       return true;
     }
+
+    // Global auto-chart: "make a bar chart", "create a line chart", "build a scatter plot"
+    // Only fires when a mark type is present in the message
+    const chartTrigger = /\b(?:make|create|build|generate|give me|show me|draw)\b/.test(lower);
+    if (chartTrigger) {
+      const mark = (markTypes as string[]).find(m => new RegExp(`\\b${m}\\b`).test(lower));
+      if (mark) return doAutoChart(mark);
+    }
+
+    // Global channel reassignment: "change x to price", "set y to horsepower"
+    // Run before the general edit handler so it doesn't open the full edit menu
+    if (/change|set|make|update|switch|use|put/.test(lower)) {
+      if (handleChannelReassignment(lower)) return true;
+    }
+
     if (/\bedit\b|change|update|modify|undo|go back|fix/.test(lower) && step() !== 'edit_menu' && !step().startsWith('edit_')) {
-      openEditMenu(step());
-      return true;
+      openEditMenu(step()); return true;
     }
     return false;
   };
@@ -540,23 +892,36 @@ export function ConversationAgent() {
     const text = raw.trim();
     if (!text) return;
     push('user', text);
-    setInput('');
+    setInputVal('');
     inputEl?.focus();
     const lower = text.toLowerCase();
+
+    extractSlots(text, spec.fields.map(f => f.name));
 
     if (handleGlobal(lower)) return;
 
     switch (step()) {
 
       case 'data_source': {
-        if (/\b1\b|example/.test(lower)) {
-          push('agent', `Available example datasets: ${VEGA_DATASETS.join(', ')}.\nWhich one?`, VEGA_DATASETS);
+        const urlM = text.match(/https?:\/\/\S+/);
+        if (urlM) { push('agent', 'Fetching data. Please wait.'); loadUrl(urlM[0]); break; }
+
+        const ds = slotDataset() ?? bestDatasetMatch(lower);
+        if (ds) {
+          push('agent', `Loading "${ds}". Please wait.`);
+          setSlotDataset(null);
+          loadVega(ds);
+          break;
+        }
+
+        if (/\b1\b|example|dataset/.test(lower)) {
+          push('agent', `Available example datasets:\n${VEGA_DATASETS.join(', ')}\n\nWhich one?`, VEGA_DATASETS);
           setStep('data_example_choice');
         } else if (/\b2\b|url|http/.test(lower)) {
           push('agent', 'Paste the URL to your JSON or CSV dataset.');
           setStep('data_url');
         } else {
-          push('agent', 'Reply with 1 for example datasets, or 2 to load from a URL.', ['1. Example dataset', '2. Load from URL']);
+          push('agent', 'What data would you like to use? Name a dataset (e.g. "cars") or paste a URL.', ['Example dataset', 'Load from URL']);
         }
         break;
       }
@@ -564,7 +929,7 @@ export function ConversationAgent() {
       case 'data_example_choice': {
         const hit = bestDatasetMatch(lower);
         if (hit) { push('agent', `Loading "${hit}". Please wait.`); loadVega(hit); }
-        else push('agent', `Didn't recognise that. Options: ${VEGA_DATASETS.join(', ')}.`, VEGA_DATASETS);
+        else push('agent', `Didn't recognise that. Options:\n${VEGA_DATASETS.join(', ')}`, VEGA_DATASETS);
         break;
       }
 
@@ -586,8 +951,40 @@ export function ConversationAgent() {
           break;
         }
         spec.fields.forEach(f => specActions.setFieldActive(f.name, selected.includes(f.name)));
-        push('agent', `Selected: ${selected.join(', ')}.\nWould you like visual, audio, or both?`, ['Visual', 'Audio', 'Both']);
-        setStep('modality');
+
+        const mod = slotModality();
+        if (mod) {
+          setPendingModality(mod);
+          setSlotModality(null);
+          const mark = slotMark();
+          if (mark && (mod === 'visual' || mod === 'both')) {
+            push('agent', `Selected: ${selected.join(', ')}. Using "${mod}" with "${mark}" mark.`);
+            specActions.addVisualUnit();
+            const vUnit = spec.visual.units[spec.visual.units.length - 1]?.name;
+            if (vUnit) specActions.changeMark(vUnit, mark as any);
+            if (mod === 'both') specActions.addAudioUnit();
+            setSlotMark(null);
+            setReviewQueue(selected);
+            setReviewField(null);
+            push('agent', 'Review field types and encodings?', ['Yes, review fields', 'No, skip to encoding']);
+            setStep('field_review');
+          } else {
+            push('agent', `Selected: ${selected.join(', ')}. Using "${mod}".`);
+            if (mod === 'visual' || mod === 'both') {
+              push('agent', `What mark type? Options: ${markTypes.join(', ')}.`, markTypes as string[]);
+              setStep('visual_mark');
+            } else {
+              specActions.addAudioUnit();
+              setReviewQueue(selected);
+              setReviewField(null);
+              push('agent', 'Added audio unit. Review field types and encodings?', ['Yes, review fields', 'No, skip to encoding']);
+              setStep('field_review');
+            }
+          }
+        } else {
+          push('agent', `Selected: ${selected.join(', ')}.\nWould you like visual, audio, or both?`, ['Visual', 'Audio', 'Both']);
+          setStep('modality');
+        }
         break;
       }
 
@@ -595,9 +992,28 @@ export function ConversationAgent() {
         const hasV = /visual/.test(lower), hasA = /audio/.test(lower), hasB = /both/.test(lower);
         const mod: 'visual' | 'audio' | 'both' = (hasB || (hasV && hasA)) ? 'both' : hasA ? 'audio' : 'visual';
         setPendingModality(mod);
+        setSlotModality(null);
+
         if (mod === 'visual' || mod === 'both') {
-          push('agent', `What mark type? Options: ${markTypes.join(', ')}.`, markTypes as string[]);
-          setStep('visual_mark');
+          const mark = slotMark();
+          if (mark) {
+            push('agent', `Using "${mark}" mark.`);
+            specActions.addVisualUnit();
+            const vUnit = spec.visual.units[spec.visual.units.length - 1]?.name;
+            if (vUnit) specActions.changeMark(vUnit, mark as any);
+            if (mod === 'both') specActions.addAudioUnit();
+            setSlotMark(null);
+            setReviewQueue(activeFieldNames());
+            setReviewField(null);
+            push('agent',
+              `Added "${mark}" visual unit${mod === 'both' ? ' and audio unit' : ''}.\nReview field types and encodings?`,
+              ['Yes, review fields', 'No, skip to encoding']
+            );
+            setStep('field_review');
+          } else {
+            push('agent', `What mark type? Options: ${markTypes.join(', ')}.`, markTypes as string[]);
+            setStep('visual_mark');
+          }
         } else {
           specActions.addAudioUnit();
           setReviewQueue(activeFieldNames());
@@ -615,6 +1031,7 @@ export function ConversationAgent() {
         const vUnit = spec.visual.units[spec.visual.units.length - 1]?.name;
         if (vUnit) specActions.changeMark(vUnit, mark as any);
         if (pendingModality() === 'both') specActions.addAudioUnit();
+        setSlotMark(null);
         setReviewQueue(activeFieldNames());
         setReviewField(null);
         push('agent',
@@ -628,11 +1045,14 @@ export function ConversationAgent() {
       case 'field_review': {
         if (reviewField() === null) {
           if (/yes|review/.test(lower)) startFieldReview(reviewQueue());
-          else { push('agent', encodingPrompt(), activeFieldNames().slice(0, 3).map(f => `encode ${f} as x`)); setStep('encoding'); }
+          else {
+            if (!applySlotEncodings()) push('agent', encodingPrompt(), activeFieldNames().slice(0, 3).map(f => `encode ${f} as x`));
+            setStep('encoding');
+          }
           break;
         }
         if (/skip all|no more|done reviewing/.test(lower)) {
-          push('agent', encodingPrompt(), activeFieldNames().slice(0, 3).map(f => `encode ${f} as x`));
+          if (!applySlotEncodings()) push('agent', encodingPrompt(), activeFieldNames().slice(0, 3).map(f => `encode ${f} as x`));
           setStep('encoding'); break;
         }
         if (/skip/.test(lower)) { nextFieldReview(); break; }
@@ -687,8 +1107,8 @@ export function ConversationAgent() {
       }
 
       case 'encoding': {
-        if (/\bdone\b|finish|that'?s?\s*it|no more|stop/.test(lower)) {
-          push('agent', 'All done! ' + buildSummary());
+        if (/\bdone\b|finish|that'?s?\s*it|no more|stop|looks good/.test(lower)) {
+          push('agent', 'All done!\n\n' + buildSummary(), ['Edit something', 'Restart']);
           setStep('done'); break;
         }
         if (/add visual unit|new visual unit/.test(lower)) {
@@ -706,7 +1126,6 @@ export function ConversationAgent() {
           const fieldName = bestFieldMatch(removeM[1], activeFieldNames());
           const prop = resolveChannel(removeM[2]);
           if (fieldName && prop) {
-            // FIX: use typed helpers instead of encoding[prop as any] (ts7053)
             const unit = allUnits().find(u =>
               u.type === 'visual'
                 ? getVisualEncodingField(spec.visual.units as any, u.name, prop) === fieldName
@@ -715,22 +1134,23 @@ export function ConversationAgent() {
             if (unit) { specActions.removeEncoding(fieldName, prop, unit.name); push('agent', `Removed "${fieldName}" from ${prop}.`, ['done']); break; }
           }
         }
-        const enc = parseEncodeCommand(lower);
+        const enc = parseEncodeCommand(lower, activeFieldNames());
         if (enc) {
           const candidates = allUnits().filter(u =>
-            (isVisualProp(enc.prop) && u.type === 'visual') || (isAudioProp(enc.prop) && u.type === 'audio')
+            (isVisualProp(enc.channel) && u.type === 'visual') || (isAudioProp(enc.channel) && u.type === 'audio')
           );
           if (!candidates.length) {
-            const needed = isVisualProp(enc.prop) ? 'visual' : 'audio';
+            const needed = isVisualProp(enc.channel) ? 'visual' : 'audio';
             push('agent', `No ${needed} unit found. Say "add ${needed} unit" first.`); break;
           }
           if (candidates.length > 1) {
-            setPendingEncField(enc.field); setPendingEncProp(enc.prop);
-            push('agent', `Which unit for "${enc.field}" → ${enc.prop}? ${candidates.map(u => u.name).join(', ')}.`, candidates.map(u => u.name));
+            setPendingEncField(enc.field); setPendingEncProp(enc.channel);
+            push('agent', `Which unit for "${enc.field}" → ${enc.channel}?\n${candidates.map(u => u.name).join(', ')}.`, candidates.map(u => u.name));
             setStep('encoding_which_unit'); break;
           }
-          specActions.addEncoding(enc.field, enc.prop, candidates[0].name);
-          push('agent', `Encoded "${enc.field}" as ${enc.prop} in "${candidates[0].name}".\n\n` + encodingPrompt(),
+          specActions.addEncoding(enc.field, enc.channel, candidates[0].name);
+          push('agent',
+            `Encoded "${enc.field}" as ${enc.channel} in "${candidates[0].name}".\n\n` + encodingPrompt(),
             activeFieldNames().filter(f => f !== enc.field).slice(0, 3).map(f => `encode ${f} as y`)
           ); break;
         }
@@ -752,12 +1172,14 @@ export function ConversationAgent() {
         break;
       }
 
+      // ── Edit steps ────────────────────────────────────────────────────────
+
       case 'edit_menu': handleEditMenu(lower); break;
 
       case 'edit_dataset': {
         const hit = bestDatasetMatch(lower);
         if (hit) { push('agent', `Loading "${hit}". Please wait.`); loadVega(hit); }
-        else push('agent', `Didn't recognise that dataset. Options: ${VEGA_DATASETS.join(', ')}.`, VEGA_DATASETS);
+        else push('agent', `Didn't recognise that. Options:\n${VEGA_DATASETS.join(', ')}.`, VEGA_DATASETS);
         break;
       }
 
@@ -778,7 +1200,7 @@ export function ConversationAgent() {
         const mark = (markTypes as string[]).find(m => lower.includes(m));
         if (unit && mark) {
           specActions.changeMark(unit.name, mark as any);
-          push('agent', `Changed "${unit.name}" mark to ${mark}.`, ['Edit something', 'Continue', 'Done']);
+          push('agent', `Changed "${unit.name}" mark to ${mark}.`, ['Edit something', 'Looks good, done!']);
           setStep(stepBeforeEdit());
         } else if (!unit) {
           push('agent', `Couldn't find that unit. Units: ${spec.visual.units.map(u => u.name).join(', ')}.`, spec.visual.units.map(u => u.name));
@@ -789,14 +1211,14 @@ export function ConversationAgent() {
       }
 
       case 'edit_encoding_add': {
-        const enc = parseEncodeCommand(lower);
+        const enc = parseEncodeCommand(lower, activeFieldNames());
         if (enc) {
           const candidates = allUnits().filter(u =>
-            (isVisualProp(enc.prop) && u.type === 'visual') || (isAudioProp(enc.prop) && u.type === 'audio')
+            (isVisualProp(enc.channel) && u.type === 'visual') || (isAudioProp(enc.channel) && u.type === 'audio')
           );
           if (candidates.length) {
-            specActions.addEncoding(enc.field, enc.prop, candidates[0].name);
-            push('agent', `Encoded "${enc.field}" as ${enc.prop}.`, ['Edit something', 'Add another encoding', 'Done']);
+            specActions.addEncoding(enc.field, enc.channel, candidates[0].name);
+            push('agent', `Encoded "${enc.field}" as ${enc.channel}.`, ['Edit something', 'Add another encoding', 'Looks good, done!']);
             setStep(stepBeforeEdit());
           } else {
             push('agent', 'No matching unit. Add a visual or audio unit first.');
@@ -813,7 +1235,6 @@ export function ConversationAgent() {
           const fieldName = bestFieldMatch(removeM[1], activeFieldNames());
           const prop = resolveChannel(removeM[2]);
           if (fieldName && prop) {
-            // FIX: use typed helpers instead of encoding[prop as any] (ts7053)
             const unit = allUnits().find(u =>
               u.type === 'visual'
                 ? getVisualEncodingField(spec.visual.units as any, u.name, prop) === fieldName
@@ -821,12 +1242,12 @@ export function ConversationAgent() {
             );
             if (unit) {
               specActions.removeEncoding(fieldName, prop, unit.name);
-              push('agent', `Removed "${fieldName}" from ${prop}.`, ['Edit something', 'Done']);
+              push('agent', `Removed "${fieldName}" from ${prop}.`, ['Edit something', 'Looks good, done!']);
               setStep(stepBeforeEdit()); break;
             }
           }
         }
-        push('agent', 'Say "remove <field> from <channel>", e.g. "remove Miles per Gallon from x".');
+        push('agent', 'Say "remove <field> from <channel>", e.g. "remove price from x".');
         break;
       }
 
@@ -837,7 +1258,7 @@ export function ConversationAgent() {
           const mtype = resolveMeasureType(typeM[2]);
           if (fieldName && mtype) {
             specActions.setFieldType(fieldName, mtype);
-            push('agent', `Set "${fieldName}" to ${mtype}.`, ['Edit something', 'Done']);
+            push('agent', `Set "${fieldName}" to ${mtype}.`, ['Edit something', 'Looks good, done!']);
             setStep(stepBeforeEdit()); break;
           }
         }
@@ -849,9 +1270,16 @@ export function ConversationAgent() {
       }
 
       case 'done':
-        push('agent', 'Chart is already configured. Say "edit" to change something, "summary" to review, or "restart" to start over.',
-          ['Edit something', 'Summary', 'Restart']
-        );
+        // After auto-creation the user might say "looks good" or ask to change something
+        if (/looks good|done|finish|great|perfect|yes/.test(lower)) {
+          push('agent', 'Great! Your chart is ready. Say "edit" anytime to make changes.',
+            ['Edit something', 'Summary', 'Restart']
+          );
+        } else {
+          push('agent', 'Chart is configured. Say "edit" to change something, "summary" to review, or "restart" to start over.',
+            ['Edit something', 'Summary', 'Restart']
+          );
+        }
         break;
     }
   };
@@ -870,10 +1298,10 @@ export function ConversationAgent() {
     rec.onerror = (e: any) => {
       setListening(false);
       const msgs: Record<string, string> = {
-        network: 'Network error: Chrome cannot reach the speech server. Check your connection or VPN.',
+        network: 'Network error. Check your connection.',
         'not-allowed': 'Microphone access denied. Allow it in your browser settings.',
         'no-speech': 'No speech detected. Please try again.',
-        'audio-capture': 'No microphone found. Please connect one and try again.',
+        'audio-capture': 'No microphone found.',
       };
       push('agent', msgs[e.error] ?? `Speech error: ${e.error}. Please type instead.`);
     };
@@ -886,7 +1314,6 @@ export function ConversationAgent() {
     <div role="tabpanel" id="tabpanel-conversationAgent" aria-labelledby="tab-conversationAgent">
       <h2>Conversational Agent</h2>
 
-      {/* Hidden live region for screen reader announcements */}
       <div
         role="status"
         aria-live="polite"
@@ -900,7 +1327,6 @@ export function ConversationAgent() {
         <History ref={historyEl} aria-label="Conversation history" aria-live="off">
           <For each={messages()}>
             {(msg) => (
-              // FIX: use msgrole instead of role to avoid HTML attribute conflict (ts2322)
               <MessageItem
                 msgrole={msg.role}
                 aria-label={`${msg.role === 'agent' ? 'Agent' : 'You'}: ${msg.text}`}
@@ -935,11 +1361,11 @@ export function ConversationAgent() {
           <ChatInput
             ref={inputEl}
             placeholder="Type a message and press Enter…"
-            value={input()}
+            value={inputVal()}
             aria-label="Type your message"
             aria-describedby="chat-hint"
-            onInput={e => setInput(e.currentTarget.value)}
-            onKeyDown={e => { if (e.key === 'Enter') handleInput(input()); }}
+            onInput={e => setInputVal(e.currentTarget.value)}
+            onKeyDown={e => { if (e.key === 'Enter') handleInput(inputVal()); }}
           />
           <IconBtn
             onClick={doRestart}
@@ -949,8 +1375,8 @@ export function ConversationAgent() {
             <span aria-hidden="true">↺</span>
           </IconBtn>
           <SendBtn
-            onClick={() => handleInput(input())}
-            disabled={!input().trim()}
+            onClick={() => handleInput(inputVal())}
+            disabled={!inputVal().trim()}
             aria-label="Send message"
           >
             Send
@@ -959,8 +1385,8 @@ export function ConversationAgent() {
       </Wrap>
 
       <p id="chat-hint" style={{ 'font-size': '12px', color: '#666', margin: '4px 0 0' }}>
-        Type and press Enter or Send. Use suggested reply buttons, or the microphone for voice input.
-        Say "summary" at any time to review your choices, "edit" to change something, or "restart" to begin again.
+        Try describing your whole chart at once — e.g. "bar chart of weather data" or "line chart of stocks".
+        Say "summary" to review, "edit" to change something, or "restart" to begin again.
       </p>
     </div>
   );

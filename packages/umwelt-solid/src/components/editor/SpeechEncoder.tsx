@@ -288,15 +288,15 @@ export function SpeechEncoder() {
           color: 'black',
         }}
       >
-        <option value="en-US">🇺🇸 US English</option>
-        <option value="en-GB">🇬🇧 British English</option>
-        <option value="en-AU">🇦🇺 Australian English</option>
-        <option value="en-IN">🇮🇳 Indian English</option>
-        <option value="en-ZA">🇿🇦 South African English</option>
-        <option value="en-NZ">🇳🇿 New Zealand English</option>
-        <option value="en-IE">🇮🇪 Irish English</option>
-        <option value="en-CA">🇨🇦 Canadian English</option>
-        <option value="en-SG">🇸🇬 Singapore English</option>
+        <option value="en-US"> US English</option>
+        <option value="en-GB"> British English</option>
+        <option value="en-AU"> Australian English</option>
+        <option value="en-IN">Indian English</option>
+        <option value="en-ZA"> South African English</option>
+        <option value="en-NZ"> New Zealand English</option>
+        <option value="en-IE"> Irish English</option>
+        <option value="en-CA"> Canadian English</option>
+        <option value="en-SG"> Singapore English</option>
       </select>
 
       {/* Mic button */}
@@ -313,7 +313,7 @@ export function SpeechEncoder() {
           color: 'black',
         }}
       >
-        {listening() ? '🎤 Listening...' : '🎤 Mic'}
+        {listening() ? 'Listening...' : '🎤 Mic'}
       </button>
 
       {/* Show status message after speaking */}
