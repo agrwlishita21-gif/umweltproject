@@ -16,7 +16,7 @@ render(
   () => (
     <Router base="/">
       <Routes>
-        <Route path="/:spec?" component={App} /> {/* 👈 Define the home page route */}
+        <Route path="/:spec?" component={App} /> {/* Define the home page route */}
       </Routes>
     </Router>
   ),

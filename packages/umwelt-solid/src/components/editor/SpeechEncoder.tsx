@@ -313,7 +313,7 @@ export function SpeechEncoder() {
           color: 'black',
         }}
       >
-        {listening() ? 'Listening...' : '🎤 Mic'}
+        {listening() ? 'Listening...' : 'Microphone'}
       </button>
 
       {/* Show status message after speaking */}
