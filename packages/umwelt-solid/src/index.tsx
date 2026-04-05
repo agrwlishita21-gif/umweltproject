@@ -12,7 +12,7 @@ if (import.meta.env.DEV && !(root instanceof HTMLElement)) {
 
 render(
   () => (
-    <Router base="/umwelt/editor/">
+    <Router base="/">
       <Routes>
         <Route path="/:spec?" component={App} /> {/* 👈 Define the home page route */}
       </Routes>
