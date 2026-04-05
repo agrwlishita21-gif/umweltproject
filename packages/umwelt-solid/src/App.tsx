@@ -6,8 +6,10 @@ import { UmweltDatastoreProvider } from './contexts/UmweltDatastoreContext';
 import { Umwelt } from './components';
 
 const App: Component = () => {
+  console.log('Rendering App component');
   return (
     <div class={styles.App}>
+      <div style={{ color: 'red' }}>DEBUG: App is rendering</div>
       <UmweltDatastoreProvider>
         <UmweltSpecProvider>
           <Umwelt />
