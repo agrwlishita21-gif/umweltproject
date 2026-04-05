@@ -14,6 +14,7 @@ export type VisualizationProps = {
 export function Visualization(props: VisualizationProps) {
   const [umweltSelection, umweltSelectionActions] = useUmweltSelection();
   const [isMouseOver, setIsMouseOver] = createSignal(false);
+  let containerRef: HTMLDivElement | undefined;
 
   const onSelectionStore = debounce((store: VlSelectionStore) => {
     // Update the selection when the brush store changes
@@ -22,6 +23,12 @@ export function Visualization(props: VisualizationProps) {
       umweltSelectionActions.setSelection({ source: 'visualization', predicate });
     }
   }, 250);
+
+  const getContainerWidth = () => {
+    if (!containerRef) return 600;
+    const parentWidth = (containerRef.parentElement?.clientWidth || 800) * 0.8;
+    return Math.max(parentWidth, 420);
+  };
 
   createEffect(() => {
     // Update the view when the selection changes
@@ -51,7 +58,13 @@ export function Visualization(props: VisualizationProps) {
 
     if (vlSpec) {
       try {
-        const view = renderVegaLite(vlSpec, '#vl-container');
+        const width = getContainerWidth();
+        const specWithSize = {
+          ...vlSpec,
+          width,
+          height: width,
+        };
+        const view = renderVegaLite(specWithSize, '#vl-container');
 
         view.addDataListener('brush_store', (_: any, value: VlSelectionStore) => {
           onSelectionStore(value);
@@ -76,5 +89,13 @@ export function Visualization(props: VisualizationProps) {
     setIsMouseOver(false);
   };
 
-  return <div id="vl-container" onMouseEnter={onMouseEnter} onMouseLeave={onMouseLeave}></div>;
+  return (
+    <div
+      ref={containerRef}
+      id="vl-container"
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
+
+    ></div>
+  );
 }

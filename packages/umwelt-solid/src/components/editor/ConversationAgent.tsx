@@ -56,6 +56,21 @@ const TYPE_ALIASES: Record<string, MeasureType> = {
   temporal: 'temporal', time: 'temporal', date: 'temporal', datetime: 'temporal',
 };
 
+// ── Mark type aliases ─────────────────────────────────────────────────────
+const MARK_ALIASES: Record<string, string> = {
+  point: 'point', scatter: 'point', scatterplot: 'point', dots: 'point',
+  line: 'line', linechart: 'line', trend: 'line', curve: 'line',
+  bar: 'bar', barchart: 'bar', column: 'bar', columns: 'bar',
+  area: 'area', areachart: 'area', filled: 'area', stacked: 'area',
+};
+
+const resolveMark = (spoken: string): string | undefined => {
+  const lower = spoken.toLowerCase().trim();
+  if (MARK_ALIASES[lower]) return MARK_ALIASES[lower];
+  const key = Object.keys(MARK_ALIASES).find(k => lower.includes(k) || k.includes(lower));
+  return key ? MARK_ALIASES[key] : undefined;
+};
+
 // ── Fuzzy helpers ─────────────────────────────────────────────────────────────
 
 const norm = (s: string) => s.toLowerCase().replace(/[\s_\-()\/]+/g, '');
@@ -66,6 +81,20 @@ const fieldMatchScore = (spoken: string, fieldName: string): number => {
   if (nf === ns) return 100;
   if (nf.startsWith(ns) || ns.startsWith(nf)) return 80;
   if (nf.includes(ns) || ns.includes(nf)) return 60;
+  
+  // Check if spoken words (separated by space) match underscore-separated parts
+  const spokenWords = spoken.toLowerCase().split(/\s+/).filter(Boolean);
+  const fieldParts = fieldName.toLowerCase().split(/[_\-\s]+/).filter(Boolean);
+  
+  // If user said multiple words, try to match them to field parts
+  if (spokenWords.length > 1) {
+    const matchedParts = spokenWords.filter(word => 
+      fieldParts.some(part => part.includes(word) || word.includes(part))
+    );
+    if (matchedParts.length === spokenWords.length) return 85;  // All words matched
+    if (matchedParts.length > 0) return 40 + (matchedParts.length * 5);  // Some words matched
+  }
+  
   const sToks = ns.match(/[a-z0-9]+/g) ?? [];
   const fToks = nf.match(/[a-z0-9]+/g) ?? [];
   const overlap = sToks.filter(t => fToks.some(ft => ft.includes(t) || t.includes(ft))).length;
@@ -283,6 +312,8 @@ export function ConversationAgent() {
   const mk = _mk;
 
   const [vegaCache, setVegaCache] = createStoredSignal<Record<string, UmweltDataset>>('vegaDatasetsCache2', {});
+  const [pendingChannel, setPendingChannel] = createSignal<EncodingPropName | undefined>(undefined);
+  const [pendingMark, setPendingMark] = createSignal(false);
 
   let historyEl: HTMLOListElement | undefined;
   let inputEl: HTMLInputElement | undefined;
@@ -401,10 +432,10 @@ export function ConversationAgent() {
 
     push('agent',
       `I've created a default chart for you:\n\n` +
-      `📊 Bar chart\n` +
+      `Bar chart\n` +
       `  • x = ${defaults.xField} (${xType})\n` +
       `  • y = ${defaults.yField} (${yType})\n\n` +
-      `🔊 Audio unit\n` +
+      `Audio unit\n` +
       `  • pitch = ${defaults.yField}\n\n` +
       `Does this look right, or would you like to make changes?`,
       ['Looks good!', 'Make changes']
@@ -438,9 +469,9 @@ export function ConversationAgent() {
     const fieldNames = allFieldNames();
 
     // ── Change mark type ─────────────────────────────────────────────────
-    // "line chart", "make it a scatter", "change to bar", "use point mark"
-    const mark = (markTypes as string[]).find(m => new RegExp(`\\b${m}\\b`).test(lower));
-    if (mark) {
+    // "line chart", "scatter", "change to bar", "use point mark"
+    const mark = resolveMark(lower);
+    if (mark && (markTypes as string[]).includes(mark)) {
       if (!spec.visual.units.length) {
         specActions.addVisualUnit();
       }
@@ -459,11 +490,49 @@ export function ConversationAgent() {
     }
 
     // ── Remove visual unit ───────────────────────────────────────────────
-    if (/remove\s+visual|no\s+visual|delete\s+visual/.test(lower)) {
+    // "remove visual", "remove vis_unit_1", "remove area", "remove bar chart"
+    const removeVisM = lower.match(/remove\s+(.+)/);
+    if (removeVisM) {
       const units = [...spec.visual.units];
       if (!units.length) return 'No visual unit to remove';
-      for (const u of units) specActions.removeVisualUnit(u.name);
-      return 'Removed visual unit';
+
+      const userInput = removeVisM[1].trim();
+      
+      // First, check if user is removing by mark type (e.g., "remove area", "remove line")
+      const markToRemove = resolveMark(userInput);
+      if (markToRemove && (markTypes as string[]).includes(markToRemove)) {
+        const targetUnit = units.find(u => u.mark === markToRemove);
+        if (targetUnit) {
+          specActions.removeVisualUnit(targetUnit.name);
+          return `Removed visual unit with "${markToRemove}" mark`;
+        }
+        const availableMarks = units.map(u => `${u.name} (${u.mark})`).join(', ');
+        return `No "${markToRemove}" mark found. Available: ${availableMarks}`;
+      }
+      
+      // Check if this is trying to remove a visual/chart unit by name/number
+      if (/visual|vis|chart|unit/.test(userInput)) {
+        // Extract any number from the input (e.g., "1" from "visual unit 1" or "vis_unit_1")
+        const numberMatch = userInput.match(/(\d+)/);
+        
+        if (numberMatch) {
+          const number = numberMatch[1];
+          // Find unit whose name contains this number
+          const targetUnit = units.find(u => u.name.includes(number));
+          if (targetUnit) {
+            specActions.removeVisualUnit(targetUnit.name);
+            return `Removed visual unit "${targetUnit.name}"`;
+          }
+        }
+        
+        // If only one unit exists, remove it automatically
+        if (units.length === 1) {
+          specActions.removeVisualUnit(units[0].name);
+          return `Removed visual unit "${units[0].name}"`;
+        }
+        
+        return `Couldn't find visual unit matching "${userInput}". Available: ${units.map(u => u.name).join(', ')}`;
+      }
     }
 
     // ── Add another visual unit ──────────────────────────────────────────
@@ -661,6 +730,8 @@ export function ConversationAgent() {
     setMessages([mk('agent', text)]);
     setSuggestions(chips);
     setStep('data_source');
+    setPendingChannel(undefined);
+    setPendingMark(false);
     announce('Restarted.');
   };
 
@@ -671,16 +742,12 @@ export function ConversationAgent() {
     setTimeout(() => {
       const names = spec.fields.map(f => f.name);
 
-      // Check if user pre-specified fields in their original message
-      // (e.g. "bar chart of date and price in stocks")
-      // For now just activate all fields — user can narrow down in confirm step
+      // Activate all fields — user can adjust them later in confirm step
       spec.fields.forEach(f => specActions.setFieldActive(f.name, true));
 
-      push('agent',
-        `Data loaded! Fields: ${names.join(', ')}.\n\nWhich fields would you like to use? Say "all" or list specific ones.`,
-        ['all', ...names.slice(0, 4)]
-      );
-      setStep('fields');
+      push('agent', `Data loaded! Fields: ${names.join(', ')}. Creating your chart now…`);
+
+      setTimeout(() => autoCreateChart(), 150);
     }, 300);
   };
 
@@ -789,6 +856,26 @@ export function ConversationAgent() {
     ]);
   });
 
+  let lastSeenDataset = spec.data.name;
+
+  // ── Detect external dataset changes ────────────────────────────────────────
+  // If user changes dataset outside the agent, restart the conversation.
+  // Uses the same reactive trigger as the visualization: spec.data.name change
+  createEffect(() => {
+    const currentDataset = spec.data.name;
+
+    // Only trigger restart if:
+    // 1. Currently in confirm or done step (agent finished, not loading data)
+    // 2. Dataset actually changed from what we last saw
+    if ((step() === 'confirm' || step() === 'done') && currentDataset && currentDataset !== lastSeenDataset) {
+      push('agent', `I noticed the dataset changed to "${currentDataset}". Restarting conversation…`);
+      setTimeout(() => doRestart(), 500);
+    }
+
+    // Track the current dataset so we can detect changes next time
+    lastSeenDataset = currentDataset;
+  });
+
   // ── Global commands ───────────────────────────────────────────────────────
   // These work at any step.
 
@@ -801,7 +888,7 @@ export function ConversationAgent() {
       return true;
     }
     if (/\bupload\b|my file|my own|from my computer/.test(lower)) {
-      push('agent', 'Click the 📎 button below to upload a CSV or JSON file.');
+      push('agent', 'Click the upload button below to upload a CSV or JSON file.');
       triggerFileUpload();
       return true;
     }
@@ -841,7 +928,13 @@ export function ConversationAgent() {
         const ds = bestDatasetMatch(lower);
         if (ds) { push('agent', `Loading "${ds}". Please wait.`); loadVega(ds); break; }
 
-        if (/\b1\b|example/.test(lower)) {
+        // Check first if user wants to keep the already-loaded dataset
+        if ((/\b1\b|keep|already loaded|use.*loaded|continue|same data/.test(lower)) && spec.data.name) {
+          // User chose to keep the already-loaded dataset
+          spec.fields.forEach(f => specActions.setFieldActive(f.name, true));
+          push('agent', `Great — using "${spec.data.name}". Creating your chart now…`);
+          setTimeout(() => autoCreateChart(), 150);
+        } else if (/\b1\b|example/.test(lower)) {
           push('agent',
             `Here are the available example datasets:\n\n${VEGA_DATASETS.map((d, i) => `${i + 1}. ${d}`).join('\n')}\n\nWhich one would you like?`,
             VEGA_DATASETS
@@ -851,13 +944,8 @@ export function ConversationAgent() {
           push('agent', 'Paste the URL to your JSON or CSV dataset below.');
           setStep('data_url');
         } else if (/\b3\b|upload|my file|my own|from my computer/.test(lower)) {
-          push('agent', 'Click the 📎 button below to select a CSV or JSON file from your computer.');
+          push('agent', 'Click the upload button below to select a CSV or JSON file from your computer.');
           triggerFileUpload();
-        } else if (/\b1\b|keep|already loaded|use.*loaded|continue|same data/.test(lower) && spec.data.name) {
-          // User chose to keep the already-loaded dataset
-          spec.fields.forEach(f => specActions.setFieldActive(f.name, true));
-          push('agent', `Great — using "${spec.data.name}". Creating your chart now…`);
-          setTimeout(() => autoCreateChart(), 150);
         } else {
           // Rebuild the prompt in case data loaded/changed
           const { text, chips } = buildRestartMessage();
@@ -912,26 +1000,109 @@ export function ConversationAgent() {
             `Great! Your chart is ready.\n\n${buildSummary()}\n\nYou can say "make changes" or "restart" at any time.`,
             ['Make changes', 'Restart']
           );
+          setPendingChannel(undefined);
+          setPendingMark(false);
           setStep('done');
           break;
         }
 
         // Try to understand and apply the change
-        const changed = applyChange(lower, text);
+        let changed = applyChange(lower, text);
+        
+        // Clear pending context if user entered a remove command
+        if (/remove|delete/.test(lower)) {
+          setPendingChannel(undefined);
+          setPendingMark(false);
+        }
+        
+        // If we have a pending channel and the input is a field name, apply it (but not if it's a remove/delete command)
+        if (!changed && pendingChannel() && !/remove|delete/.test(lower)) {
+          const fieldNames = allFieldNames();
+          const matchedField = bestFieldMatch(text, fieldNames);
+          if (matchedField) {
+            const channel = pendingChannel()!;
+            const unit = allUnits().find(u =>
+              (isVisualProp(channel) && u.type === 'visual') ||
+              (isAudioProp(channel) && u.type === 'audio')
+            );
+            if (unit) {
+              encodeOnUnit(matchedField, channel, unit.name, unit.type);
+              changed = `Set ${channel} = ${matchedField}`;
+              setPendingChannel(undefined);
+            }
+          }
+        }
+        
         if (changed) {
           confirmPrompt(changed);
         } else {
-          // Couldn't understand — give helpful examples
-          push('agent',
-            `I didn't quite understand that change. Here are some things you can say:\n` +
-            `  • "line chart" or "change to scatter"\n` +
-            `  • "change x to temperature" or "set color to species"\n` +
-            `  • "add another audio unit" or "remove audio"\n` +
-            `  • "encode humidity as y"\n` +
-            `  • "use only date and price"\n\n` +
-            `Or say "looks good" when you're happy.`,
-            ['Looks good!', 'Line chart', 'Change x field', 'Add audio unit', 'Remove audio unit']
-          );
+          // Check for incomplete mark type change (e.g., "change mark" without specifying which mark)
+          if (/change.*mark|mark.*type|change.*chart/.test(lower) && !resolveMark(lower)) {
+            push('agent',
+              `Which mark type would you like?\n\nAvailable: ${(markTypes as string[]).join(', ')}\n\nTry: "line", "bar", "area", or "scatter point".`,
+              (markTypes as string[]).map(m => `${m} chart`)
+            );
+            setPendingMark(true);
+            // Stay in confirm step to process the mark selection
+          } else if (pendingMark() && !/remove|delete/.test(lower)) {
+            // User is responding to mark type question (but not if they're trying to remove something)
+            const selectedMark = resolveMark(lower);
+            if (selectedMark && (markTypes as string[]).includes(selectedMark)) {
+              if (!spec.visual.units.length) {
+                specActions.addVisualUnit();
+              }
+              const vUnit = spec.visual.units[spec.visual.units.length - 1]?.name;
+              if (vUnit) {
+                specActions.changeMark(vUnit, selectedMark as any);
+                setPendingMark(false);
+                confirmPrompt(`Changed mark to "${selectedMark}"`);
+              }
+            } else {
+              // Invalid mark, show options again
+              push('agent',
+                `That's not a valid mark type. Please choose from: ${(markTypes as string[]).join(', ')}`,
+                (markTypes as string[]).map(m => `${m} chart`)
+              );
+            }
+          } else {
+            // Check for incomplete encoding request (e.g., "change y" without specifying which field)
+            const fieldNames = allFieldNames();
+            const incompleteChannel = resolveChannel(lower);
+            
+            if (incompleteChannel && /change|set|encode|assign/.test(lower) && !fieldNames.some(f => lower.includes(norm(f)))) {
+              // User mentioned a channel but didn't specify a field
+              const currentField = allUnits()
+                .flatMap(u => {
+                  if (u.type === 'visual' && isVisualProp(incompleteChannel)) {
+                    return getVisualEncodingField(spec.visual.units as any, u.name, incompleteChannel) || [];
+                  }
+                  if (u.type === 'audio' && isAudioProp(incompleteChannel)) {
+                    return getAudioEncodingField(spec.audio.units as any, u.name, incompleteChannel) || [];
+                  }
+                  return [];
+                })[0];
+              
+              push('agent',
+                `Which field would you like to set for "${incompleteChannel}"?${currentField ? ` (currently: ${currentField})` : ''}\n\nAvailable fields: ${fieldNames.join(', ')}`,
+                fieldNames.slice(0, 4)
+              );
+              // Track that we're waiting for a field for this channel
+              setPendingChannel(incompleteChannel);
+              // Stay in confirm step to process the field selection
+            } else {
+              // Couldn't understand — give helpful examples
+              push('agent',
+                `I didn't quite understand that change. Here are some things you can say:\n` +
+                `  • "line chart" or "point chart"\n` +
+                `  • "change x to temperature" or "set color to species"\n` +
+                `  • "add another audio unit" or "remove audio"\n` +
+                `  • "encode humidity as y"\n` +
+                `  • "use only date and price"\n\n` +
+                `Or say "looks good" when you're happy.`,
+                ['Looks good!', 'Line chart', 'Change x field', 'Add audio unit', 'Remove audio unit']
+              );
+            }
+          }
         }
         break;
       }
@@ -945,9 +1116,14 @@ export function ConversationAgent() {
             `Done — ${changed}.\n\n${buildSummary()}\n\nAnything else?`,
             ['Looks good!', 'Make more changes', 'Restart']
           );
-        } else if (/make changes|edit|change|update|modify/.test(lower)) {
+        } else if (/make changes|edit|update|modify/.test(lower)) {
+          const fieldNames = allFieldNames();
           push('agent',
-            `Sure! What would you like to change?\n\nCurrent state:\n${buildSummary()}\n\nYou can say things like "line chart", "change x to date", or "add audio unit".`,
+            `Sure! What would you like to change?\n\nCurrent state:\n${buildSummary()}\n\nExamples:\n` +
+            `  • Chart type: ${(markTypes as string[]).join(', ')}\n` +
+            `  • Set channel: "change x to ${fieldNames[0] || 'field'}", "color by ${fieldNames[1] || 'field'}"\n` +
+            `  • Audio: "add audio unit", "remove audio unit"\n` +
+            `  • Visual: "remove visual unit"\n\nWhat would you like to change?`,
             ['Line chart', 'Change x field', 'Change y field', 'Add audio unit', 'Remove audio']
           );
           setStep('confirm');
@@ -1047,14 +1223,14 @@ export function ConversationAgent() {
             aria-label={listening() ? 'Listening' : 'Start voice input'}
             aria-pressed={listening()}
           >
-            <span aria-hidden="true">🎤</span>
+            <span aria-hidden="true"><strong>Mic</strong></span>
           </IconBtn>
           <IconBtn
             onClick={triggerFileUpload}
             aria-label="Upload a CSV or JSON file"
             title="Upload file"
           >
-            <span aria-hidden="true">📎</span>
+            <span aria-hidden="true"><strong>Upload</strong></span>
           </IconBtn>
           <ChatInput
             ref={inputEl}
@@ -1070,20 +1246,20 @@ export function ConversationAgent() {
             aria-label="Restart conversation"
             title="Restart"
           >
-            <span aria-hidden="true">↺</span>
+            <span aria-hidden="true"><strong>Restart</strong></span>
           </IconBtn>
           <SendBtn
             onClick={() => handleInput(inputVal())}
             disabled={!inputVal().trim()}
             aria-label="Send message"
           >
-            Send
+            <strong>Send</strong>
           </SendBtn>
         </InputArea>
       </Wrap>
 
       <p id="chat-hint" style={{ 'font-size': '12px', color: '#666', margin: '4px 0 0' }}>
-        Upload your own CSV or JSON with 📎, or name an example dataset.
+        Upload your own CSV or JSON with the upload button below, or name an example dataset.
         After the chart is created, describe any changes — e.g. "line chart", "change x to date", "add audio unit".
         Say "summary" or "restart" at any time.
       </p>
