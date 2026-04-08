@@ -1,4 +1,4 @@
-import { createSignal, createEffect, For } from 'solid-js';
+import { createSignal, createEffect, on, onMount, For } from 'solid-js';
 import { styled } from 'solid-styled-components';
 import { useUmweltSpec } from '../../contexts/UmweltSpecContext';
 import { useUmweltDatastore } from '../../contexts/UmweltDatastoreContext';
@@ -185,6 +185,33 @@ const getAudioEncodingField = (
   return unit?.encoding[prop as AudioPropName]?.field;
 };
 
+// ── Serialization helpers for external-change detection ───────────────────────
+// Produce stable JSON strings from spec slices so createEffect(on(...)) can
+// cheaply detect what changed between renders.
+
+const serializeFields = (fields: { name: string; active: boolean }[]): string =>
+  JSON.stringify(fields.filter(f => f.active).map(f => f.name).sort());
+
+const serializeVisual = (units: any[]): string =>
+  JSON.stringify(units.map(u => ({
+    name: u.name,
+    mark: String(u.mark ?? ''),
+    channels: Object.entries(u.encoding ?? {})
+      .filter(([, v]: any) => v?.field)
+      .map(([ch, v]: any) => `${ch}:${v.field}`)
+      .sort(),
+  })));
+
+const serializeAudio = (units: any[]): string =>
+  JSON.stringify(units.map(u => ({
+    name: u.name,
+    channels: Object.entries(u.encoding ?? {})
+      .filter(([, v]: any) => v?.field)
+      .map(([ch, v]: any) => `${ch}:${v.field}`)
+      .sort(),
+    traversal: (u.traversal ?? []).map((t: any) => t.field),
+  })));
+
 // ── Styled components ─────────────────────────────────────────────────────────
 
 const Wrap = styled('div')`
@@ -304,6 +331,17 @@ const [suggestions, setSuggestions] = createSignal<string[]>([
 // Note: createEffect on mount will replace these if data is already loaded
 const [liveMsg, setLiveMsg] = createSignal('');
 
+// ── Agent-writing guard ────────────────────────────────────────────────────────
+// Set true while the agent programmatically mutates spec so the external-change
+// effects below don't fire on agent-initiated writes.
+const [agentWriting, setAgentWriting] = createSignal(false);
+
+// ── Snapshot signals for external-change diffing ──────────────────────────────
+// Module-level so they persist across tab switches, just like `messages`.
+const [lastSeenFields, setLastSeenFields] = createSignal<string>('[]');
+const [lastSeenVisual, setLastSeenVisual] = createSignal<string>('[]');
+const [lastSeenAudio, setLastSeenAudio] = createSignal<string>('[]');
+
 // ── Component ──────────────────────────────────────────────────────────────────
 
 export function ConversationAgent() {
@@ -314,6 +352,15 @@ export function ConversationAgent() {
   const [vegaCache, setVegaCache] = createStoredSignal<Record<string, UmweltDataset>>('vegaDatasetsCache2', {});
   const [pendingChannel, setPendingChannel] = createSignal<EncodingPropName | undefined>(undefined);
   const [pendingMark, setPendingMark] = createSignal(false);
+
+  // Bracket any block of specActions mutations so the external-change effects
+  // ignore agent-initiated writes. The guard is cleared after a microtask so
+  // Solid's scheduled effects (which are also microtasks) see it while firing.
+  const withAgentWriting = (fn: () => void) => {
+    setAgentWriting(true);
+    fn();
+    Promise.resolve().then(() => setAgentWriting(false));
+  };
 
   let historyEl: HTMLOListElement | undefined;
   let inputEl: HTMLInputElement | undefined;
@@ -391,40 +438,42 @@ export function ConversationAgent() {
   // using Vega-Lite field-type heuristics. Then enters 'confirm' step.
 
   const autoCreateChart = () => {
-    // Clear any existing units first for a clean slate
-    for (const u of [...spec.visual.units]) specActions.removeVisualUnit(u.name);
-    for (const u of [...spec.audio.units]) specActions.removeAudioUnit(u.name);
-
     const defaults = inferDefaults();
+    let vUnit: string | undefined;
+    let aUnit: string | undefined;
 
-    if (!defaults) {
-      // Not enough type variety — just create a unit and ask user to encode manually
+    // All specActions mutations are wrapped so the external-change effects
+    // don't fire on these agent-initiated writes.
+    withAgentWriting(() => {
+      for (const u of [...spec.visual.units]) specActions.removeVisualUnit(u.name);
+      for (const u of [...spec.audio.units]) specActions.removeAudioUnit(u.name);
+
       specActions.addVisualUnit();
       specActions.addAudioUnit();
-      const vUnit = spec.visual.units[spec.visual.units.length - 1]?.name;
+      vUnit = spec.visual.units[spec.visual.units.length - 1]?.name;
+      aUnit = spec.audio.units[spec.audio.units.length - 1]?.name;
+
       if (vUnit) specActions.changeMark(vUnit, 'bar' as any);
+
+      if (defaults) {
+        if (vUnit) {
+          specActions.addEncoding(defaults.xField, 'x', vUnit);
+          specActions.addEncoding(defaults.yField, 'y', vUnit);
+        }
+        if (aUnit) {
+          specActions.addEncoding(defaults.yField, 'pitch', aUnit);
+        }
+      }
+    });
+
+    if (!defaults) {
+      // Not enough type variety — just created units, ask user to encode manually
       push('agent',
         `I've created a visual and audio unit but couldn't infer default encodings — the dataset may not have a clear mix of categorical and quantitative fields.\n\nFields: ${activeFieldNames().join(', ')}\n\nTell me what to encode — e.g. "encode price as x" or "change mark to line".`,
         activeFieldNames().slice(0, 3).map(f => `encode ${f} as x`)
       );
       setStep('confirm');
       return;
-    }
-
-    // Create visual unit with bar mark and x/y encodings
-    specActions.addVisualUnit();
-    const vUnit = spec.visual.units[spec.visual.units.length - 1]?.name;
-    if (vUnit) {
-      specActions.changeMark(vUnit, 'bar' as any);
-      specActions.addEncoding(defaults.xField, 'x', vUnit);
-      specActions.addEncoding(defaults.yField, 'y', vUnit);
-    }
-
-    // Create audio unit with pitch encoding on the quantitative field
-    specActions.addAudioUnit();
-    const aUnit = spec.audio.units[spec.audio.units.length - 1]?.name;
-    if (aUnit) {
-      specActions.addEncoding(defaults.yField, 'pitch', aUnit);
     }
 
     const xType = spec.fields.find(f => f.name === defaults.xField)?.type ?? '';
@@ -453,16 +502,18 @@ export function ConversationAgent() {
   // one. This ensures "encode body_mass as y" replaces y rather than adding
   // a second y encoding.
   const encodeOnUnit = (field: string, channel: EncodingPropName, unitName: string, unitType: 'visual' | 'audio') => {
-    // Find and remove any existing encoding on this channel in this unit
-    if (unitType === 'visual') {
-      const existing = getVisualEncodingField(spec.visual.units as any, unitName, channel);
-      if (existing) specActions.removeEncoding(existing, channel, unitName);
-    } else {
-      const existing = getAudioEncodingField(spec.audio.units as any, unitName, channel);
-      if (existing) specActions.removeEncoding(existing, channel, unitName);
-    }
-    specActions.setFieldActive(field, true);
-    specActions.addEncoding(field, channel, unitName);
+    withAgentWriting(() => {
+      // Find and remove any existing encoding on this channel in this unit
+      if (unitType === 'visual') {
+        const existing = getVisualEncodingField(spec.visual.units as any, unitName, channel);
+        if (existing) specActions.removeEncoding(existing, channel, unitName);
+      } else {
+        const existing = getAudioEncodingField(spec.audio.units as any, unitName, channel);
+        if (existing) specActions.removeEncoding(existing, channel, unitName);
+      }
+      specActions.setFieldActive(field, true);
+      specActions.addEncoding(field, channel, unitName);
+    });
   };
 
   const applyChange = (lower: string, original: string): string | null => {
@@ -735,6 +786,105 @@ export function ConversationAgent() {
     announce('Restarted.');
   };
 
+  // ── Capture baseline snapshots when entering confirm or done ─────────────────
+  // When the agent finishes building the chart, record the current spec state
+  // so the external-change effects below can diff against it.
+  createEffect(on(step, (currentStep) => {
+    if (currentStep === 'confirm' || currentStep === 'done') {
+      setLastSeenFields(serializeFields(spec.fields));
+      setLastSeenVisual(serializeVisual(spec.visual.units as any));
+      setLastSeenAudio(serializeAudio(spec.audio.units as any));
+    }
+  }, { defer: true }));
+
+  // ── On-mount tab-return diff ──────────────────────────────────────────────
+  // The ConversationAgent unmounts every time the user switches to another tab
+  // (Dynamic only renders one tab at a time), so createEffect blocks are disposed
+  // while the user is away. This onMount callback runs every time the user
+  // navigates back to this tab and catches any changes made in other tabs.
+  onMount(() => {
+    if (step() !== 'confirm' && step() !== 'done') return;
+
+    const currFields = serializeFields(spec.fields);
+    const currVisual = serializeVisual(spec.visual.units as any);
+    const currAudio  = serializeAudio(spec.audio.units as any);
+
+    // ── Fields diff ──────────────────────────────────────────────────────
+    if (currFields !== lastSeenFields()) {
+      const prevActive: string[] = JSON.parse(lastSeenFields());
+      const currActive: string[] = JSON.parse(currFields);
+      const activated   = currActive.filter(n => !prevActive.includes(n));
+      const deactivated = prevActive.filter(n => !currActive.includes(n));
+      const parts: string[] = [];
+      if (activated.length)   parts.push(`activated: ${activated.join(', ')}`);
+      if (deactivated.length) parts.push(`deactivated: ${deactivated.join(', ')}`);
+      if (parts.length) {
+        push('agent',
+          `Welcome back! I see you changed the active fields — ${parts.join('; ')}.\n\n` +
+          `Active fields are now: ${currActive.join(', ') || 'none'}.\n\n` +
+          `Would you like me to re-encode the chart with these fields, or make any other changes?`,
+          ['Re-encode chart', 'Looks good!', 'Make changes']
+        );
+        setLastSeenFields(currFields);
+      }
+    }
+
+    // ── Visual diff ──────────────────────────────────────────────────────
+    if (currVisual !== lastSeenVisual()) {
+      type VUnit = { name: string; mark: string; channels: string[] };
+      const prevUnits: VUnit[] = JSON.parse(lastSeenVisual());
+      const currUnits: VUnit[] = JSON.parse(currVisual);
+      const notices: string[] = [];
+      for (const curr of currUnits) {
+        const p = prevUnits.find(u => u.name === curr.name);
+        if (!p) { notices.push(`a new visual unit "${curr.name}" was added`); continue; }
+        if (p.mark !== curr.mark) notices.push(`mark changed to "${curr.mark}" in "${curr.name}"`);
+        const added   = curr.channels.filter(c => !p.channels.includes(c));
+        const removed = p.channels.filter(c => !curr.channels.includes(c));
+        if (added.length)   notices.push(`added encoding ${added.join(', ')} in "${curr.name}"`);
+        if (removed.length) notices.push(`removed encoding ${removed.join(', ')} in "${curr.name}"`);
+      }
+      for (const p of prevUnits) {
+        if (!currUnits.find(u => u.name === p.name)) notices.push(`visual unit "${p.name}" was removed`);
+      }
+      if (notices.length) {
+        push('agent',
+          `Welcome back! I see you made visual changes — ${notices.join('; ')}.\n\nWould you like any other adjustments?`,
+          ['Looks good!', 'Make changes', 'Restart']
+        );
+        setLastSeenVisual(currVisual);
+      }
+    }
+
+    // ── Audio diff ───────────────────────────────────────────────────────
+    if (currAudio !== lastSeenAudio()) {
+      type AUnit = { name: string; channels: string[]; traversal: string[] };
+      const prevUnits: AUnit[] = JSON.parse(lastSeenAudio());
+      const currUnits: AUnit[] = JSON.parse(currAudio);
+      const notices: string[] = [];
+      for (const curr of currUnits) {
+        const p = prevUnits.find(u => u.name === curr.name);
+        if (!p) { notices.push(`a new audio unit "${curr.name}" was added`); continue; }
+        const added   = curr.channels.filter(c => !p.channels.includes(c));
+        const removed = p.channels.filter(c => !curr.channels.includes(c));
+        if (added.length)   notices.push(`added encoding ${added.join(', ')} in "${curr.name}"`);
+        if (removed.length) notices.push(`removed encoding ${removed.join(', ')} in "${curr.name}"`);
+        if (JSON.stringify(curr.traversal) !== JSON.stringify(p.traversal))
+          notices.push(`traversal order changed in "${curr.name}" to: ${curr.traversal.join(' → ') || 'none'}`);
+      }
+      for (const p of prevUnits) {
+        if (!currUnits.find(u => u.name === p.name)) notices.push(`audio unit "${p.name}" was removed`);
+      }
+      if (notices.length) {
+        push('agent',
+          `Welcome back! I see you made audio changes — ${notices.join('; ')}.\n\nWould you like any other adjustments?`,
+          ['Looks good!', 'Make changes', 'Restart']
+        );
+        setLastSeenAudio(currAudio);
+      }
+    }
+  });
+
   // ── Data loading ──────────────────────────────────────────────────────────
 
   const onDataReady = () => {
@@ -743,7 +893,7 @@ export function ConversationAgent() {
       const names = spec.fields.map(f => f.name);
 
       // Activate all fields — user can adjust them later in confirm step
-      spec.fields.forEach(f => specActions.setFieldActive(f.name, true));
+      withAgentWriting(() => spec.fields.forEach(f => specActions.setFieldActive(f.name, true)));
 
       push('agent', `Data loaded! Fields: ${names.join(', ')}. Creating your chart now…`);
 
@@ -868,13 +1018,125 @@ export function ConversationAgent() {
     // 1. Currently in confirm or done step (agent finished, not loading data)
     // 2. Dataset actually changed from what we last saw
     if ((step() === 'confirm' || step() === 'done') && currentDataset && currentDataset !== lastSeenDataset) {
-      push('agent', `I noticed the dataset changed to "${currentDataset}". Restarting conversation…`);
+      push('agent',
+        `I noticed you switched the dataset` +
+        (lastSeenDataset ? ` from "${lastSeenDataset}"` : '') +
+        ` to "${currentDataset}".\n\nRestarting the conversation for the new dataset…`
+      );
       setTimeout(() => doRestart(), 500);
     }
 
     // Track the current dataset so we can detect changes next time
     lastSeenDataset = currentDataset;
   });
+
+  // ── Detect external field changes (Fields tab) ────────────────────────────
+  // When the user toggles fields in the Fields tab while the agent is at
+  // confirm or done, acknowledge without restarting.
+  createEffect(on(
+    () => serializeFields(spec.fields),
+    (current, prev) => {
+      if (agentWriting()) return;
+      if (step() !== 'confirm' && step() !== 'done') return;
+      const prevStr = prev ?? '[]';
+      if (current === prevStr) return;
+
+      const prevActive: string[] = JSON.parse(prevStr);
+      const currActive: string[] = JSON.parse(current);
+      const activated = currActive.filter(n => !prevActive.includes(n));
+      const deactivated = prevActive.filter(n => !currActive.includes(n));
+      const parts: string[] = [];
+      if (activated.length) parts.push(`activated: ${activated.join(', ')}`);
+      if (deactivated.length) parts.push(`deactivated: ${deactivated.join(', ')}`);
+      if (!parts.length) return;
+
+      push('agent',
+        `I see you changed the active fields — ${parts.join('; ')}.\n\n` +
+        `Active fields are now: ${currActive.join(', ') || 'none'}.\n\n` +
+        `Would you like me to re-encode the chart with these fields, or make any other changes?`,
+        ['Re-encode chart', 'Looks good!', 'Make changes']
+      );
+      setLastSeenFields(current);
+    },
+    { defer: true }
+  ));
+
+  // ── Detect external visual unit changes (Visual tab) ─────────────────────
+  // When mark type or encoding changes in the Visual tab.
+  createEffect(on(
+    () => serializeVisual(spec.visual.units as any),
+    (current, prev) => {
+      if (agentWriting()) return;
+      if (step() !== 'confirm' && step() !== 'done') return;
+      const prevStr = prev ?? '[]';
+      if (current === prevStr) return;
+
+      type VUnit = { name: string; mark: string; channels: string[] };
+      const prevUnits: VUnit[] = JSON.parse(prevStr);
+      const currUnits: VUnit[] = JSON.parse(current);
+      const notices: string[] = [];
+
+      for (const curr of currUnits) {
+        const p = prevUnits.find(u => u.name === curr.name);
+        if (!p) { notices.push(`a new visual unit "${curr.name}" was added`); continue; }
+        if (p.mark !== curr.mark) notices.push(`mark changed to "${curr.mark}" in "${curr.name}"`);
+        const added = curr.channels.filter(c => !p.channels.includes(c));
+        const removed = p.channels.filter(c => !curr.channels.includes(c));
+        if (added.length) notices.push(`added encoding ${added.join(', ')} in "${curr.name}"`);
+        if (removed.length) notices.push(`removed encoding ${removed.join(', ')} in "${curr.name}"`);
+      }
+      for (const p of prevUnits) {
+        if (!currUnits.find(u => u.name === p.name)) notices.push(`visual unit "${p.name}" was removed`);
+      }
+      if (!notices.length) return;
+
+      push('agent',
+        `I see you made visual changes — ${notices.join('; ')}.\n\nWould you like any other adjustments?`,
+        ['Looks good!', 'Make changes', 'Restart']
+      );
+      setLastSeenVisual(current);
+    },
+    { defer: true }
+  ));
+
+  // ── Detect external audio unit changes (Audio tab) ────────────────────────
+  // When encoding or traversal changes in the Audio tab.
+  createEffect(on(
+    () => serializeAudio(spec.audio.units as any),
+    (current, prev) => {
+      if (agentWriting()) return;
+      if (step() !== 'confirm' && step() !== 'done') return;
+      const prevStr = prev ?? '[]';
+      if (current === prevStr) return;
+
+      type AUnit = { name: string; channels: string[]; traversal: string[] };
+      const prevUnits: AUnit[] = JSON.parse(prevStr);
+      const currUnits: AUnit[] = JSON.parse(current);
+      const notices: string[] = [];
+
+      for (const curr of currUnits) {
+        const p = prevUnits.find(u => u.name === curr.name);
+        if (!p) { notices.push(`a new audio unit "${curr.name}" was added`); continue; }
+        const added = curr.channels.filter(c => !p.channels.includes(c));
+        const removed = p.channels.filter(c => !curr.channels.includes(c));
+        if (added.length) notices.push(`added encoding ${added.join(', ')} in "${curr.name}"`);
+        if (removed.length) notices.push(`removed encoding ${removed.join(', ')} in "${curr.name}"`);
+        if (JSON.stringify(curr.traversal) !== JSON.stringify(p.traversal))
+          notices.push(`traversal order changed in "${curr.name}" to: ${curr.traversal.join(' → ') || 'none'}`);
+      }
+      for (const p of prevUnits) {
+        if (!currUnits.find(u => u.name === p.name)) notices.push(`audio unit "${p.name}" was removed`);
+      }
+      if (!notices.length) return;
+
+      push('agent',
+        `I see you made audio changes — ${notices.join('; ')}.\n\nWould you like any other adjustments?`,
+        ['Looks good!', 'Make changes', 'Restart']
+      );
+      setLastSeenAudio(current);
+    },
+    { defer: true }
+  ));
 
   // ── Global commands ───────────────────────────────────────────────────────
   // These work at any step.
@@ -931,7 +1193,7 @@ export function ConversationAgent() {
         // Check first if user wants to keep the already-loaded dataset
         if ((/\b1\b|keep|already loaded|use.*loaded|continue|same data/.test(lower)) && spec.data.name) {
           // User chose to keep the already-loaded dataset
-          spec.fields.forEach(f => specActions.setFieldActive(f.name, true));
+          withAgentWriting(() => spec.fields.forEach(f => specActions.setFieldActive(f.name, true)));
           push('agent', `Great — using "${spec.data.name}". Creating your chart now…`);
           setTimeout(() => autoCreateChart(), 150);
         } else if (/\b1\b|example/.test(lower)) {
@@ -982,7 +1244,7 @@ export function ConversationAgent() {
         }
 
         // Activate selected fields, deactivate the rest
-        spec.fields.forEach(f => specActions.setFieldActive(f.name, selected.includes(f.name)));
+        withAgentWriting(() => spec.fields.forEach(f => specActions.setFieldActive(f.name, selected.includes(f.name))));
 
         push('agent', `Got it — using: ${selected.join(', ')}. Creating your chart now…`);
 
@@ -1006,8 +1268,10 @@ export function ConversationAgent() {
           break;
         }
 
-        // Try to understand and apply the change
+        // Try to understand and apply the change (guard prevents self-triggering effects)
+        setAgentWriting(true);
         let changed = applyChange(lower, text);
+        Promise.resolve().then(() => setAgentWriting(false));
         
         // Clear pending context if user entered a remove command
         if (/remove|delete/.test(lower)) {
@@ -1090,17 +1354,63 @@ export function ConversationAgent() {
               setPendingChannel(incompleteChannel);
               // Stay in confirm step to process the field selection
             } else {
-              // Couldn't understand — give helpful examples
-              push('agent',
-                `I didn't quite understand that change. Here are some things you can say:\n` +
-                `  • "line chart" or "point chart"\n` +
-                `  • "change x to temperature" or "set color to species"\n` +
-                `  • "add another audio unit" or "remove audio"\n` +
-                `  • "encode humidity as y"\n` +
-                `  • "use only date and price"\n\n` +
-                `Or say "looks good" when you're happy.`,
-                ['Looks good!', 'Line chart', 'Change x field', 'Add audio unit', 'Remove audio unit']
-              );
+              // Smart intent detection — give targeted feedback before falling back
+              // to a generic message.
+
+              // 1. Did the user ask for a mark type we don't support?
+              const UNSUPPORTED_MARKS = [
+                'pie', 'donut', 'doughnut', 'histogram', 'bubble', 'heatmap',
+                'treemap', 'waterfall', 'funnel', 'radar', 'sunburst',
+                'candlestick', 'boxplot', 'violin', '3d', 'stacked bar',
+              ];
+              const unsupportedMark = UNSUPPORTED_MARKS.find(m => lower.includes(m));
+
+              // 2. Did the user mention a known field name but in an unclear way?
+              const fNames = allFieldNames();
+              const mentionedField = fNames.find(f => lower.includes(norm(f)));
+
+              // 3. Did the user try to remove something but the target wasn't clear?
+              const isRemoveIntent = /remove|delete|clear|get rid/.test(lower);
+
+              if (unsupportedMark) {
+                push('agent',
+                  `"${unsupportedMark}" isn't a supported mark type.\n\n` +
+                  `Supported marks are: ${(markTypes as string[]).join(', ')}.\n\n` +
+                  `Try: "line chart", "bar chart", "scatter" (renders as point), or "area chart".`,
+                  (markTypes as string[]).map(m => `${m} chart`)
+                );
+              } else if (mentionedField && /encode|map|assign|plot|show|display|use|put/.test(lower)) {
+                // User mentioned a field but the encode command wasn't parsed — give a specific tip
+                push('agent',
+                  `I see you want to use "${mentionedField}" but I'm not sure how.\n\n` +
+                  `Try one of these:\n` +
+                  `  • "encode ${mentionedField} as x"\n` +
+                  `  • "set y to ${mentionedField}"\n` +
+                  `  • "color by ${mentionedField}"\n` +
+                  `  • "pitch = ${mentionedField}"`,
+                  [`encode ${mentionedField} as x`, `set y to ${mentionedField}`, `color by ${mentionedField}`]
+                );
+              } else if (isRemoveIntent) {
+                const firstField = fNames[0] || 'field';
+                push('agent',
+                  `Not sure what to remove. Try:\n` +
+                  `  • "remove audio" — removes the audio unit\n` +
+                  `  • "remove visual unit" — removes the visual unit\n` +
+                  `  • "remove ${firstField} from x" — clears a field from a channel`,
+                  ['Remove audio', 'Remove visual unit']
+                );
+              } else {
+                // Generic fallback with current field names for context
+                push('agent',
+                  `I didn't quite understand that. Here are some things you can try:\n` +
+                  `  • Mark type: "line chart", "bar chart", "scatter", "area chart"\n` +
+                  `  • Encode a field: "encode ${fNames[0] || 'field'} as x"\n` +
+                  `  • Change a channel: "set y to ${fNames[1] || 'field'}"\n` +
+                  `  • Remove: "remove audio unit" or "remove visual unit"\n\n` +
+                  `Or say "looks good" when you're happy.`,
+                  ['Looks good!', 'Line chart', 'Change x field', 'Add audio unit', 'Remove audio unit']
+                );
+              }
             }
           }
         }
@@ -1110,7 +1420,9 @@ export function ConversationAgent() {
       // ── done: chart is complete ────────────────────────────────────────
       case 'done': {
         // Even in done state, accept changes naturally
+        setAgentWriting(true);
         const changed = applyChange(lower, text);
+        Promise.resolve().then(() => setAgentWriting(false));
         if (changed) {
           push('agent',
             `Done — ${changed}.\n\n${buildSummary()}\n\nAnything else?`,
