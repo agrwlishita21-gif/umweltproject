@@ -2,6 +2,7 @@
 The changes we made are particularly in packages/umwelt-solid/src/components/editor
 This has two files that we added:
 ConversationAgent.tsx
+SpeechEncoder.tsx
 
 ## Using Umwelt
 
