@@ -2,7 +2,7 @@
 
 ## Using Umwelt
 
-The editor is deployed at: https://umwelt-data.github.io/umwelt/editor/
+The editor is deployed at: (https://umweltproject.onrender.com/)
 
 ## Available Scripts
 
@@ -11,7 +11,7 @@ In the project directory, you can run:
 ### `yarn dev` or `yarn start`
 
 Runs the app in the development mode.<br>
-Open [[http://localhost:3000](https://umweltproject.onrender.com/)]([http://localhost:3000](https://umweltproject.onrender.com/)) to view it in the browser.
+Open [[http://localhost:3000]) to view it in the browser.
 
 The page will reload if you make edits.<br>
 
