@@ -1,8 +1,11 @@
 # Umwelt Editor
-The changes we made are particularly in packages/umwelt-solid/src/components/editor
-This has two files that we added:
-ConversationAgent.tsx
-SpeechEncoder.tsx
+The changes we made are particularly in packages/umwelt-solid/src/components/editor<br>
+
+This has two files that we added:<br>
+
+ConversationAgent.tsx<br>
+
+SpeechEncoder.tsx<br>
 
 ## Using Umwelt
 
