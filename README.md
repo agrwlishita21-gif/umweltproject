@@ -1,4 +1,7 @@
 # Umwelt Editor
+The changes we made are particularly in packages/umwelt-solid/src/components/editor
+This has two files that we added:
+ConversationAgent.tsx
 
 ## Using Umwelt
 
@@ -36,5 +39,4 @@ Builds vitepress docs to `docs/.vitepress/dist`.
 ### `yarn docs:preview`
 
 Previews the build output from `docs/.vitepress/dist` at [http://localhost:4173](http://localhost:4173).
-# umweltproject
-# umweltproject
+
